@@ -1,14 +1,15 @@
 """对话层：OpenAI 兼容接口 + 工具调用。
 
 模型不直接改文件，只能通过 tools 里注册的这几个操作动报告，与页面按钮同源。
-边界与 skills/daily-report 一致：只改措辞与归属，不新增事实。
+整理规则放在同目录的 rules.md 里，与 skills/daily-report 共用一份，改那里两边生效。
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
 from ..config import AiConfig, Config
@@ -17,20 +18,25 @@ from .tools import ReportSession, ToolError
 
 MAX_ROUNDS = 6
 
-SYSTEM_PROMPT = """你是日报整理助手。用户的报告由 Gitee 工作项与 GitLab 提交自动汇总而来，
+# 与通道无关的那批规则，和 skills/daily-report 共用一份
+RULES = Path(__file__).with_name("rules.md")
+
+CHANNEL_PREAMBLE = """你是日报整理助手。用户的报告由 Gitee 工作项与 GitLab 提交自动汇总而来，
 结构是「日期 → 工作点 → 明细」。
 
 你能做的：改写措辞让它更像人话、合并或拆分工作点、把归错的提交挪到正确的工作点、
 填工时、按需要导出。
 
-硬边界：
-- 只改措辞与归属，不新增事实。数字、工作项标题、项目名一律以报告里的原值为准。
-- 抽不出内容的地方保持为空，如实告诉用户哪几条待补，绝不编造。
-- 标着「归属存疑」「未关联」的工作点是推断出来的，优先提醒用户确认，必要时用
-  move_commits 纠正。
-- 动手前先 read_report 看当前状态，不要凭上文猜。
+报告只能通过下面这些工具改，你没有别的写入通道。动手前先 read_report 看当前状态，
+不要凭上文猜。归属存疑的工作点用 move_commits 纠正。
 
-回话简短，说清改了什么就行，不要复述整份报告。"""
+下面是整理报告的规则，逐条照做。"""
+
+
+@lru_cache(maxsize=1)
+def system_prompt() -> str:
+    """通道说明 + 共用规则文件，拼成给模型的系统提示。"""
+    return f"{CHANNEL_PREAMBLE}\n\n{RULES.read_text(encoding='utf-8')}"
 
 
 @dataclass
@@ -120,7 +126,7 @@ class Chat:
         }
 
     def run(self, messages: Sequence[dict]) -> Iterator[Event]:
-        history = [{"role": "system", "content": SYSTEM_PROMPT}, *messages]
+        history = [{"role": "system", "content": system_prompt()}, *messages]
 
         for _round in range(MAX_ROUNDS):
             text, tool_calls = yield from self._one_turn(history)
@@ -130,8 +136,10 @@ class Chat:
 
             history.append(_assistant_turn(text, tool_calls))
             for call in tool_calls:
-                yield Event("tool", {"name": call["name"]})
-                history.append(self._invoke(call))
+                args = _safe_args(call["arguments"])
+                detail = _tool_detail(self._session, call["name"], args)
+                yield Event("tool", {"name": call["name"], "detail": detail})
+                history.append(self._invoke(call, args))
 
         yield Event("error", {"message": f"工具调用超过 {MAX_ROUNDS} 轮仍未收敛，已中止"})
         yield Event("done", self._session.stats())
@@ -159,9 +167,8 @@ class Chat:
 
         return "".join(text_parts), [c for _, c in sorted(calls.items())]
 
-    def _invoke(self, call: dict) -> dict:
+    def _invoke(self, call: dict, args: dict) -> dict:
         try:
-            args = json.loads(call["arguments"] or "{}")
             result = self._handlers[call["name"]](args)
             payload = {"ok": True, "result": result}
         except ToolError as exc:
@@ -187,6 +194,36 @@ def _build_client(ai: AiConfig) -> Any:
     from openai import OpenAI
 
     return OpenAI(api_key=ai.api_key, base_url=ai.base_url or None)
+
+
+def _safe_args(raw: str) -> dict:
+    """模型偶尔会吐出半截 JSON，解析不了就当没给参数，让工具层去报错。"""
+    try:
+        parsed = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _tool_detail(session: ReportSession, name: str, args: dict) -> str:
+    """这次调用动的是谁，给页面显示用。取不到就留空，不能因此打断对话。"""
+    try:
+        if name == "set_point":
+            return args.get("title") or session.find_point(args["point_id"]).title
+        if name == "drop_point":
+            return session.find_point(args["point_id"]).title
+        if name == "merge_points":
+            ids = args["point_ids"]
+            title = args.get("title") or session.find_point(ids[0]).title
+            return f"{len(ids)} 个工作点 → {title}"
+        if name == "move_commits":
+            target = args.get("to_new_title") or session.find_point(args["to_point_id"]).title
+            return f"{len(args['shas'])} 条提交 → {target}"
+        if name == "export":
+            return "三段式" if args.get("style") == "memo" else "工作点格式"
+    except (ToolError, KeyError, IndexError, TypeError):
+        return ""
+    return ""
 
 
 def _accumulate(calls: dict[int, dict], raw: Any) -> None:

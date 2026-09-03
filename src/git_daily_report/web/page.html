@@ -42,7 +42,8 @@
   .msg.me { align-self: flex-end; background: var(--accent); color: #fff;
             padding: 7px 12px; border-radius: 12px 12px 2px 12px; }
   .msg.ai { align-self: flex-start; }
-  .msg.sys { align-self: center; color: var(--muted); font-size: 12.5px; }
+  .msg.sys { align-self: center; color: var(--muted); font-size: 12.5px; text-align: center; }
+  .msg.sys .detail { font-size: 12px; opacity: .7; margin-top: 2px; }
   .composer { border-top: 1px solid var(--line); padding: 10px; display: flex; gap: 8px; }
   .composer textarea { flex: 1; resize: none; border: 1px solid var(--line); border-radius: 8px;
                        padding: 8px 10px; background: var(--card); color: var(--ink);
@@ -100,6 +101,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const state = { days: [], view: 'md', busy: false };
+const DETAIL_LIMIT = 6;  // 工具行最多列几个改动对象
 
 function view() {
   return document.querySelector('input[name=view]:checked').value;
@@ -152,6 +154,23 @@ function say(text, kind) {
   $('log').appendChild(el);
   $('log').scrollTop = $('log').scrollHeight;
   return el;
+}
+
+// 一条工具行：连续的同名调用折叠进同一个节点，下面挂它动过的东西
+function toolLine(name) {
+  const el = say('', 'sys');
+  el.append(document.createElement('div'), document.createElement('div'));
+  el.lastChild.className = 'detail';
+  return { name, count: 0, details: [], el };
+}
+
+function renderTool(tool) {
+  const [head, detail] = tool.el.children;
+  head.textContent = tool.count > 1 ? `调用 ${tool.name} ×${tool.count}` : `调用 ${tool.name}`;
+  const shown = tool.details.slice(0, DETAIL_LIMIT);
+  const rest = tool.details.length - shown.length;
+  detail.textContent = shown.join(' / ') + (rest > 0 ? ` …等 ${tool.details.length} 项` : '');
+  $('log').scrollTop = $('log').scrollHeight;
 }
 
 async function load() {
@@ -227,15 +246,28 @@ $('send').onclick = () => busy(async () => {
   if (!text) return;
   $('input').value = '';
   say(text, 'me');
+  // 两个游标交替置空，工具行与正文才会按真实发生顺序排下来
   let bubble = null;
+  let tool = null;
   await stream('/api/chat', { message: text }, (e) => {
     if (e.type === 'delta') {
+      tool = null;
       bubble = bubble || say('', 'ai');
       bubble.textContent += e.text;
       $('log').scrollTop = $('log').scrollHeight;
     }
-    if (e.type === 'tool') say(`调用 ${e.name}`, 'sys');
-    if (e.type === 'error') say(`出错：${e.message}`, 'sys');
+    if (e.type === 'tool') {
+      bubble = null;
+      if (!tool || tool.name !== e.name) tool = toolLine(e.name);
+      tool.count += 1;
+      if (e.detail && !tool.details.includes(e.detail)) tool.details.push(e.detail);
+      renderTool(tool);
+    }
+    if (e.type === 'error') {
+      bubble = null;
+      tool = null;
+      say(`出错：${e.message}`, 'sys');
+    }
   });
 });
 
