@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>每日工作点</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9; --card: #fff; --ink: #1a1d21; --muted: #6b7280;
+    --line: #e3e6ea; --accent: #2563eb; --warn: #b91c1c; --warn-bg: #fef2f2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181c; --card: #1e2126; --ink: #e6e8ea; --muted: #9aa2ad;
+      --line: #2e333a; --accent: #60a5fa; --warn: #f87171; --warn-bg: #2a1a1a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column;
+         background: var(--bg); color: var(--ink);
+         font: 14px/1.65 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { background: var(--card); border-bottom: 1px solid var(--line);
+           padding: 10px 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  button, input, select { font: inherit; }
+  button { border: 1px solid var(--line); background: var(--card); color: var(--ink);
+           border-radius: 6px; padding: 5px 11px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { color: #fff; opacity: .9; }
+  input[type=date] { border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px;
+                     background: var(--card); color: var(--ink); }
+  .stat { color: var(--muted); font-size: 13px; }
+  .grow { flex: 1; }
+  main { flex: 1; display: grid; grid-template-columns: minmax(280px, 2fr) 3fr; min-height: 0; }
+  section { min-height: 0; display: flex; flex-direction: column; }
+  #chat { border-right: 1px solid var(--line); }
+  .log { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex;
+         flex-direction: column; gap: 12px; }
+  .msg { max-width: 90%; white-space: pre-wrap; word-break: break-word; }
+  .msg.me { align-self: flex-end; background: var(--accent); color: #fff;
+            padding: 7px 12px; border-radius: 12px 12px 2px 12px; }
+  .msg.ai { align-self: flex-start; }
+  .msg.sys { align-self: center; color: var(--muted); font-size: 12.5px; }
+  .composer { border-top: 1px solid var(--line); padding: 10px; display: flex; gap: 8px; }
+  .composer textarea { flex: 1; resize: none; border: 1px solid var(--line); border-radius: 8px;
+                       padding: 8px 10px; background: var(--card); color: var(--ink);
+                       font: inherit; height: 60px; }
+  .preview { flex: 1; overflow-y: auto; padding: 8px 20px 24px; }
+  .preview h2 { font-size: 15px; margin: 22px 0 6px; padding-bottom: 5px;
+                border-bottom: 1px solid var(--line); }
+  .preview h3 { font-size: 14px; margin: 14px 0 4px; font-weight: 600; }
+  .preview ul { margin: 0 0 4px; padding-left: 20px; }
+  .preview pre { white-space: pre-wrap; word-break: break-word; margin: 12px 0; }
+  .note { color: var(--warn); background: var(--warn-bg); border-radius: 4px;
+          font-size: 12px; font-weight: normal; padding: 1px 6px; margin-left: 6px; }
+  .toolbar { border-top: 1px solid var(--line); background: var(--card);
+             padding: 8px 16px; display: flex; gap: 8px; align-items: center; }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+  .gaps { background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn);
+          border-radius: 8px; padding: 12px 16px; margin: 16px; }
+  .gaps ul { margin: 8px 0 0; padding-left: 20px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <button data-range="today">今天</button>
+  <button data-range="week">本周</button>
+  <button data-range="month">本月</button>
+  <button data-range="last-month">上月</button>
+  <input type="date" id="since"> ~ <input type="date" id="until">
+  <button class="primary" id="pull">拉取数据</button>
+  <span class="stat" id="stat"></span>
+  <span class="grow"></span>
+</header>
+
+<main>
+  <section id="chat">
+    <div class="log" id="log"></div>
+    <div class="composer">
+      <textarea id="input" placeholder="例如：把 8/1 的两条合并成一条；这条改得专业一点；未关联的那些挪到态势图层"></textarea>
+      <button class="primary" id="send">发送</button>
+    </div>
+  </section>
+
+  <section>
+    <div class="preview" id="preview"></div>
+    <div class="toolbar">
+      <button id="copy">复制全文</button>
+      <button id="download">下载 .md</button>
+      <span class="grow"></span>
+      <label class="stat"><input type="radio" name="view" value="md" checked> 工作点</label>
+      <label class="stat"><input type="radio" name="view" value="memo"> 三段式</label>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const state = { days: [], view: 'md', busy: false };
+
+function view() {
+  return document.querySelector('input[name=view]:checked').value;
+}
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function renderGaps(gaps) {
+  return `<div class="gaps"><b>缺少凭证，无法采集</b><ul>${
+    gaps.map((g) => `<li><code>${esc(g)}</code></li>`).join('')
+  }</ul><p>在项目根目录的 <code>.env</code> 里补齐后重启即可。</p></div>`;
+}
+
+function esc(text) {
+  return String(text).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+
+async function renderPreview() {
+  const box = $('preview');
+  if (state.gaps && state.gaps.length) { box.innerHTML = renderGaps(state.gaps); return; }
+  if (!state.days.length) {
+    box.innerHTML = '<div class="empty">这个区间还没有内容，点「拉取数据」开始。</div>';
+    return;
+  }
+  if (view() === 'memo') {
+    const res = await fetch('/api/export?style=memo');
+    box.innerHTML = `<pre><code>${esc(await res.text())}</code></pre>`;
+    return;
+  }
+  box.innerHTML = state.days.map((day) => {
+    const points = day.points.map((p) => {
+      const note = p.note ? `<span class="note">${esc(p.note)}</span>` : '';
+      const hours = p.hours != null ? `<span class="note">${p.hours} 小时</span>` : '';
+      const items = p.entries.map((e) => `<li>${esc(e)}</li>`).join('');
+      return `<h3>${esc(p.title)}${note}${hours}</h3><ul>${items}</ul>`;
+    }).join('');
+    const warn = day.hoursWarning ? `<div class="note">${esc(day.hoursWarning)}</div>` : '';
+    return `<h2>${day.day}</h2>${warn}${points}`;
+  }).join('');
+}
+
+function say(text, kind) {
+  const el = document.createElement('div');
+  el.className = `msg ${kind}`;
+  el.textContent = text;
+  $('log').appendChild(el);
+  $('log').scrollTop = $('log').scrollHeight;
+  return el;
+}
+
+async function load() {
+  const data = await api('/api/state');
+  $('since').value = data.range.since;
+  $('until').value = data.range.until;
+  state.days = data.days;
+  state.gaps = data.gaps;
+  $('stat').textContent = data.stats.points
+    ? `工作点 ${data.stats.points} · 待确认 ${data.stats.review}`
+    : '';
+  if (!data.ai) $('send').disabled = true;
+  await renderPreview();
+}
+
+async function setPeriod(payload) {
+  await api('/api/period', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  await load();
+}
+
+function stream(path, body, onEvent) {
+  return new Promise((resolve, reject) => {
+    fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(async (res) => {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split('\n\n');
+        buffer = frames.pop();
+        for (const frame of frames) {
+          const line = frame.replace(/^data: /, '');
+          if (line) onEvent(JSON.parse(line));
+        }
+      }
+      resolve();
+    }).catch(reject);
+  });
+}
+
+async function busy(fn) {
+  if (state.busy) return;
+  state.busy = true;
+  $('pull').disabled = true;
+  $('send').disabled = true;
+  try { await fn(); } finally {
+    state.busy = false;
+    $('pull').disabled = false;
+    $('send').disabled = false;
+    await load();
+  }
+}
+
+$('pull').onclick = () => busy(async () => {
+  const line = say('拉取中…', 'sys');
+  await stream('/api/sync', { since: $('since').value, until: $('until').value }, (e) => {
+    if (e.type === 'progress') line.textContent = e.text;
+    if (e.type === 'summary') say(e.text, 'sys');
+    if (e.type === 'error') say(`出错：${e.message}`, 'sys');
+  });
+});
+
+$('send').onclick = () => busy(async () => {
+  const text = $('input').value.trim();
+  if (!text) return;
+  $('input').value = '';
+  say(text, 'me');
+  let bubble = null;
+  await stream('/api/chat', { message: text }, (e) => {
+    if (e.type === 'delta') {
+      bubble = bubble || say('', 'ai');
+      bubble.textContent += e.text;
+      $('log').scrollTop = $('log').scrollHeight;
+    }
+    if (e.type === 'tool') say(`调用 ${e.name}`, 'sys');
+    if (e.type === 'error') say(`出错：${e.message}`, 'sys');
+  });
+});
+
+$('input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('send').click();
+});
+
+document.querySelectorAll('[data-range]').forEach((btn) => {
+  btn.onclick = () => setPeriod({ shortcut: btn.dataset.range });
+});
+['since', 'until'].forEach((id) => {
+  $(id).onchange = () => setPeriod({ since: $('since').value, until: $('until').value });
+});
+document.querySelectorAll('input[name=view]').forEach((radio) => {
+  radio.onchange = renderPreview;
+});
+
+$('copy').onclick = async () => {
+  const res = await fetch(`/api/export?style=${view()}`);
+  await navigator.clipboard.writeText(await res.text());
+  say('已复制到剪贴板', 'sys');
+};
+
+$('download').onclick = () => {
+  window.location = `/api/export?style=${view()}&download=1`;
+};
+
+load();
+</script>
+</body>
+</html>
