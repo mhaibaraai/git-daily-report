@@ -136,8 +136,10 @@ class Chat:
 
             history.append(_assistant_turn(text, tool_calls))
             for call in tool_calls:
-                yield Event("tool", {"name": call["name"]})
-                history.append(self._invoke(call))
+                args = _safe_args(call["arguments"])
+                detail = _tool_detail(self._session, call["name"], args)
+                yield Event("tool", {"name": call["name"], "detail": detail})
+                history.append(self._invoke(call, args))
 
         yield Event("error", {"message": f"工具调用超过 {MAX_ROUNDS} 轮仍未收敛，已中止"})
         yield Event("done", self._session.stats())
@@ -165,9 +167,8 @@ class Chat:
 
         return "".join(text_parts), [c for _, c in sorted(calls.items())]
 
-    def _invoke(self, call: dict) -> dict:
+    def _invoke(self, call: dict, args: dict) -> dict:
         try:
-            args = json.loads(call["arguments"] or "{}")
             result = self._handlers[call["name"]](args)
             payload = {"ok": True, "result": result}
         except ToolError as exc:
@@ -193,6 +194,36 @@ def _build_client(ai: AiConfig) -> Any:
     from openai import OpenAI
 
     return OpenAI(api_key=ai.api_key, base_url=ai.base_url or None)
+
+
+def _safe_args(raw: str) -> dict:
+    """模型偶尔会吐出半截 JSON，解析不了就当没给参数，让工具层去报错。"""
+    try:
+        parsed = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _tool_detail(session: ReportSession, name: str, args: dict) -> str:
+    """这次调用动的是谁，给页面显示用。取不到就留空，不能因此打断对话。"""
+    try:
+        if name == "set_point":
+            return args.get("title") or session.find_point(args["point_id"]).title
+        if name == "drop_point":
+            return session.find_point(args["point_id"]).title
+        if name == "merge_points":
+            ids = args["point_ids"]
+            title = args.get("title") or session.find_point(ids[0]).title
+            return f"{len(ids)} 个工作点 → {title}"
+        if name == "move_commits":
+            target = args.get("to_new_title") or session.find_point(args["to_point_id"]).title
+            return f"{len(args['shas'])} 条提交 → {target}"
+        if name == "export":
+            return "三段式" if args.get("style") == "memo" else "工作点格式"
+    except (ToolError, KeyError, IndexError, TypeError):
+        return ""
+    return ""
 
 
 def _accumulate(calls: dict[int, dict], raw: Any) -> None:

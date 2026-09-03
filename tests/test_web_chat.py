@@ -16,7 +16,13 @@ from git_daily_report import store
 from git_daily_report.config import AiConfig, Config, GiteeConfig, GitlabConfig
 from git_daily_report.models import DayReport, WorkPoint
 from git_daily_report.validation import DAILY_HOURS_CAP
-from git_daily_report.web.llm import MAX_ROUNDS, Chat, system_prompt, tool_schemas
+from git_daily_report.web.llm import (
+    MAX_ROUNDS,
+    Chat,
+    _tool_detail,
+    system_prompt,
+    tool_schemas,
+)
 from git_daily_report.web.tools import ReportSession
 
 CFG = Config(
@@ -137,6 +143,65 @@ def test_tool_call_runs_then_the_model_gets_the_result(session):
     assert json.loads(tool_message["content"])["ok"] is True
 
 
+def test_tool_event_says_which_point_it_touched(session):
+    """页面只显示函数名的话，一串 set_point 看不出动了谁。"""
+    events, _ = run(
+        session,
+        [
+            [call_chunk(0, call_id="c1", name="set_point",
+                        arguments=json.dumps({"point_id": "2026-08-10/A", "title": "态势图层收尾"}))],
+            [text_chunk("改好了")],
+        ],
+    )
+
+    assert events[0].data["detail"] == "态势图层收尾"
+
+
+def test_tool_event_falls_back_to_the_current_title(session):
+    """只改工时不带 title，detail 取工作点现在的标题。"""
+    events, _ = run(
+        session,
+        [
+            [call_chunk(0, call_id="c1", name="set_point",
+                        arguments=json.dumps({"point_id": "2026-08-10/A", "hours": 3}))],
+            [text_chunk("填好了")],
+        ],
+    )
+
+    assert events[0].data["detail"] == "态势图层重构"
+
+
+def test_tool_detail_survives_a_bad_point_id(session):
+    """查不到就留空，不能让展示逻辑把整轮打断。"""
+    events, _ = run(
+        session,
+        [
+            [call_chunk(0, call_id="c1", name="set_point",
+                        arguments=json.dumps({"point_id": "2026-08-10/NOPE", "hours": 3}))],
+            [text_chunk("那条不存在")],
+        ],
+    )
+
+    assert events[0].data["detail"] == ""
+    assert [e.type for e in events] == ["tool", "delta", "done"]
+
+
+def test_broken_json_arguments_go_back_to_the_model(session):
+    """半截 JSON 当没给参数，错误照样回交模型而不是崩在解析上。"""
+    events, client = run(
+        session,
+        [
+            [call_chunk(0, call_id="c1", name="set_point", arguments='{"point_id":')],
+            [text_chunk("参数没给全")],
+        ],
+    )
+
+    assert events[0].data["detail"] == ""
+    result = json.loads(client.seen[1][-1]["content"])
+    assert result["ok"] is False
+    assert "参数不对" in result["error"]
+
+
 def test_fragmented_arguments_are_reassembled(session):
     events, _ = run(
         session,
@@ -192,6 +257,22 @@ def test_runaway_tool_loop_is_cut_off(session):
     assert events[-2].type == "error"
     assert "超过" in events[-2].data["message"]
     assert events[-1].type == "done"
+
+
+@pytest.mark.parametrize(
+    "name, args, expected",
+    [
+        ("drop_point", {"point_id": "2026-08-10/A"}, "态势图层重构"),
+        ("merge_points", {"point_ids": ["a", "b"], "title": "并完的标题"}, "2 个工作点 → 并完的标题"),
+        ("move_commits", {"shas": ["s1", "s2"], "to_new_title": "新工作点"}, "2 条提交 → 新工作点"),
+        ("export", {"style": "memo"}, "三段式"),
+        ("export", {}, "工作点格式"),
+        ("read_report", {}, ""),
+        ("sync", {}, ""),
+    ],
+)
+def test_tool_detail_per_tool(session, name, args, expected):
+    assert _tool_detail(session, name, args) == expected
 
 
 def test_every_advertised_tool_has_a_handler(session):
