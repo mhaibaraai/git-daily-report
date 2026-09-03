@@ -1,14 +1,15 @@
 """对话层：OpenAI 兼容接口 + 工具调用。
 
 模型不直接改文件，只能通过 tools 里注册的这几个操作动报告，与页面按钮同源。
-边界与 skills/daily-report 一致：只改措辞与归属，不新增事实。
+整理规则放在同目录的 rules.md 里，与 skills/daily-report 共用一份，改那里两边生效。
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
 from ..config import AiConfig, Config
@@ -17,20 +18,25 @@ from .tools import ReportSession, ToolError
 
 MAX_ROUNDS = 6
 
-SYSTEM_PROMPT = """你是日报整理助手。用户的报告由 Gitee 工作项与 GitLab 提交自动汇总而来，
+# 与通道无关的那批规则，和 skills/daily-report 共用一份
+RULES = Path(__file__).with_name("rules.md")
+
+CHANNEL_PREAMBLE = """你是日报整理助手。用户的报告由 Gitee 工作项与 GitLab 提交自动汇总而来，
 结构是「日期 → 工作点 → 明细」。
 
 你能做的：改写措辞让它更像人话、合并或拆分工作点、把归错的提交挪到正确的工作点、
 填工时、按需要导出。
 
-硬边界：
-- 只改措辞与归属，不新增事实。数字、工作项标题、项目名一律以报告里的原值为准。
-- 抽不出内容的地方保持为空，如实告诉用户哪几条待补，绝不编造。
-- 标着「归属存疑」「未关联」的工作点是推断出来的，优先提醒用户确认，必要时用
-  move_commits 纠正。
-- 动手前先 read_report 看当前状态，不要凭上文猜。
+报告只能通过下面这些工具改，你没有别的写入通道。动手前先 read_report 看当前状态，
+不要凭上文猜。归属存疑的工作点用 move_commits 纠正。
 
-回话简短，说清改了什么就行，不要复述整份报告。"""
+下面是整理报告的规则，逐条照做。"""
+
+
+@lru_cache(maxsize=1)
+def system_prompt() -> str:
+    """通道说明 + 共用规则文件，拼成给模型的系统提示。"""
+    return f"{CHANNEL_PREAMBLE}\n\n{RULES.read_text(encoding='utf-8')}"
 
 
 @dataclass
@@ -120,7 +126,7 @@ class Chat:
         }
 
     def run(self, messages: Sequence[dict]) -> Iterator[Event]:
-        history = [{"role": "system", "content": SYSTEM_PROMPT}, *messages]
+        history = [{"role": "system", "content": system_prompt()}, *messages]
 
         for _round in range(MAX_ROUNDS):
             text, tool_calls = yield from self._one_turn(history)

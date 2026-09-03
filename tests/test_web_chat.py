@@ -15,7 +15,8 @@ import pytest
 from git_daily_report import store
 from git_daily_report.config import AiConfig, Config, GiteeConfig, GitlabConfig
 from git_daily_report.models import DayReport, WorkPoint
-from git_daily_report.web.llm import MAX_ROUNDS, Chat, tool_schemas
+from git_daily_report.validation import DAILY_HOURS_CAP
+from git_daily_report.web.llm import MAX_ROUNDS, Chat, system_prompt, tool_schemas
 from git_daily_report.web.tools import ReportSession
 
 CFG = Config(
@@ -99,6 +100,22 @@ def test_system_prompt_states_the_no_invention_boundary(session):
     assert system["role"] == "system"
     assert "不新增事实" in system["content"]
     assert "绝不编造" in system["content"]
+
+
+def test_system_prompt_carries_the_memo_and_hours_rules(session):
+    """三段式与工时上限只写在 rules.md 里，拼不进来模型就无从遵守。"""
+    prompt = system_prompt()
+
+    assert all(name in prompt for name in ("具体任务", "关键数据", "问题解决过程"))
+    assert str(DAILY_HOURS_CAP) in prompt
+
+
+def test_system_prompt_stays_out_of_the_terminal_channel(session):
+    """网页里的模型只有工具，喂它 CLI 步骤会让它以为自己能跑命令。"""
+    prompt = system_prompt()
+
+    assert "dr sync" not in prompt
+    assert "uv run" not in prompt
 
 
 def test_tool_call_runs_then_the_model_gets_the_result(session):
