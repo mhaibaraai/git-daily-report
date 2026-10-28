@@ -75,3 +75,23 @@ def test_summary_counts_blocks_and_flags():
 
     text = pipeline.summarize(pipeline.RunResult(days=days, commit_count=4))
     assert text == "共 1 天、3 个工单块：生成 2 块（1 块需复核），EOM 已填 1 块；参考提交 4 条。"
+
+
+def test_fetch_returns_schedule_and_commits_without_ai(monkeypatch):
+    seen: dict = {}
+    days = [ScheduleDay("2026-10-26", (Order("1", "甲", "", "", None),))]
+    commits = [Commit("g/p", "s", "2026-10-27", "完成筛选", "完成筛选", "")]
+    install(monkeypatch, days, commits, seen)
+
+    got = pipeline.fetch(CFG, date(2026, 10, 26), date(2026, 11, 1), today=date(2026, 10, 28))
+
+    assert got == (days, commits)
+    assert "generated" not in seen
+
+
+def test_fetch_skips_gitlab_when_nothing_is_scheduled(monkeypatch):
+    seen: dict = {}
+    install(monkeypatch, [], [], seen)
+
+    assert pipeline.fetch(CFG, date(2026, 10, 26), date(2026, 11, 1)) == ([], [])
+    assert "window" not in seen

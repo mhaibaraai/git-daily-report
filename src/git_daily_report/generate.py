@@ -119,10 +119,44 @@ def generate(
         failures = _failures(pending, blocks)
     report(f"校验：{len(failures)} 块仍需复核" if failures else "校验：全部通过")
 
-    return [
-        replace(day, orders=tuple(_fill(day.day, o, blocks, failures) for o in day.orders))
-        for day in days
+    filled, _ = apply_blocks(days, blocks)
+    return [replace(day, orders=tuple(_or_missing(o) for o in day.orders)) for day in filled]
+
+
+def parse_items(raw: str) -> dict[Key, dict[str, Any]]:
+    """把 AI 回复解析成按（日期, 工单）索引的块；回复不成形就当什么都没给。"""
+    try:
+        items = json.loads(raw).get("items")
+    except (json.JSONDecodeError, AttributeError):
+        return {}
+    if not isinstance(items, list):
+        return {}
+    return {
+        (str(item.get("day")), str(item.get("orderId"))): item
+        for item in items
+        if isinstance(item, dict)
+    }
+
+
+def apply_blocks(
+    days: Sequence[ScheduleDay], blocks: Mapping[Key, dict[str, Any]]
+) -> tuple[list[ScheduleDay], dict[Key, list[str]]]:
+    """把块校验后填进排期，返回填好的排期与仍有问题的块。
+
+    只覆盖 blocks 里给出的块，便于只重写不合格的几块再合并；EOM 已填的块永不覆盖。
+    还没有内容的块记为「没有生成」。
+    """
+    filled = [
+        replace(day, orders=tuple(_fill(day.day, o, blocks) for o in day.orders)) for day in days
     ]
+    failures: dict[Key, list[str]] = {}
+    for day in filled:
+        for order in day.orders:
+            if order.progress is None:
+                failures[(day.day, order.id)] = [MISSING]
+            elif order.progress.source == "ai" and order.progress.problems:
+                failures[(day.day, order.id)] = list(order.progress.problems)
+    return filled, failures
 
 
 def _order_material(order: Order) -> dict[str, Any]:
@@ -176,18 +210,7 @@ def _tracker(report: Report, stage: str, total: int) -> OnChunk:
 def _ask(complete: Complete, user: str, on_chunk: OnChunk) -> dict[Key, dict[str, Any]]:
     """调一次 AI，解析成按（日期, 工单）索引的块；回复不成形就当什么都没给。"""
     messages = [{"role": "system", "content": system_prompt()}, {"role": "user", "content": user}]
-    raw = complete(messages, on_chunk)
-    try:
-        items = json.loads(raw).get("items")
-    except (json.JSONDecodeError, AttributeError):
-        return {}
-    if not isinstance(items, list):
-        return {}
-    return {
-        (str(item.get("day")), str(item.get("orderId"))): item
-        for item in items
-        if isinstance(item, dict)
-    }
+    return parse_items(complete(messages, on_chunk))
 
 
 def _failures(pending: set[Key], blocks: Mapping[Key, dict[str, Any]]) -> dict[Key, list[str]]:
@@ -199,23 +222,24 @@ def _failures(pending: set[Key], blocks: Mapping[Key, dict[str, Any]]) -> dict[K
     return failures
 
 
-def _fill(
-    day: str, order: Order, blocks: Mapping[Key, dict[str, Any]], failures: Mapping[Key, list[str]]
-) -> Order:
-    if order.progress is not None:
+def _fill(day: str, order: Order, blocks: Mapping[Key, dict[str, Any]]) -> Order:
+    block = blocks.get((day, order.id))
+    if block is None or (order.progress is not None and order.progress.source != "ai"):
         return order
-    key = (day, order.id)
-    block = blocks.get(key)
-    if block is None:
-        return replace(order, progress=Progress("", "", "", "ai", (MISSING,)))
     progress = Progress(
         memo=build_memo(fill_empty({k: _strings(block.get(k)) for k in ("task", "data", "problem")})),
         issue=str(block.get("issue") or "").strip() or EMPTY,
         plan=str(block.get("plan") or "").strip(),
         source="ai",
-        problems=tuple(failures.get(key, ())),
+        problems=tuple(check_block(block)),
     )
     return replace(order, progress=progress)
+
+
+def _or_missing(order: Order) -> Order:
+    if order.progress is not None:
+        return order
+    return replace(order, progress=Progress("", "", "", "ai", (MISSING,)))
 
 
 def _strings(value: Any) -> list[str]:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from git_daily_report.generate import build_material, generate
+from git_daily_report.generate import apply_blocks, build_material, generate, parse_items
 from git_daily_report.models import Commit, Order, Progress, ScheduleDay
 
 
@@ -162,3 +162,44 @@ def test_progress_announces_the_retry():
     assert "校验：1 块不合格，交给 AI 重写" in lines
     assert "AI 重写：已写出 1/1 块" in lines
     assert lines[-1] == "校验：1 块仍需复核"
+
+
+def test_parse_items_indexes_by_day_and_order():
+    raw = json.dumps({"items": [item("2026-10-26", "1"), "垃圾", {"day": "2026-10-27", "orderId": 2}]})
+
+    assert set(parse_items(raw)) == {("2026-10-26", "1"), ("2026-10-27", "2")}
+
+
+def test_parse_items_tolerates_malformed_replies():
+    assert parse_items("不是 JSON") == {}
+    assert parse_items("[]") == {}
+    assert parse_items('{"items": "x"}') == {}
+
+
+def test_apply_blocks_fills_pending_and_reports_failures():
+    days = [ScheduleDay("2026-10-26", (order("1"), order("2")))]
+    blocks = parse_items(json.dumps({"items": [item("2026-10-26", "1", task=["改 index.vue"])]}))
+
+    result, failures = apply_blocks(days, blocks)
+
+    assert set(failures) == {("2026-10-26", "1"), ("2026-10-26", "2")}
+    assert any("代码化" in p for p in failures[("2026-10-26", "1")])
+    assert result[0].orders[0].progress.problems
+    assert result[0].orders[1].progress is None
+
+
+def test_apply_blocks_only_overwrites_given_keys_and_never_eom():
+    eom = Progress(memo="具体任务：已填", issue="无", plan="联调", source="eom")
+    days = [ScheduleDay("2026-10-26", (order("1"), order("2"), order("3", progress=eom)))]
+    first, _ = apply_blocks(days, parse_items(json.dumps({"items": [
+        item("2026-10-26", "1"), item("2026-10-26", "2", plan=""),
+    ]})))
+
+    retry = {("2026-10-26", "2"): item("2026-10-26", "2", plan="完成验收"),
+             ("2026-10-26", "3"): item("2026-10-26", "3")}
+    result, failures = apply_blocks(first, retry)
+
+    assert failures == {}
+    assert result[0].orders[0].progress == first[0].orders[0].progress
+    assert result[0].orders[1].progress.plan == "完成验收"
+    assert result[0].orders[2].progress is eom
