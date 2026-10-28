@@ -1,0 +1,164 @@
+"""AI 生成：素材组装、结果解析、不合格重试与已填跳过。"""
+
+from __future__ import annotations
+
+import json
+
+from git_daily_report.generate import build_material, generate
+from git_daily_report.models import Commit, Order, Progress, ScheduleDay
+
+
+def commit(day: str, title: str, project: str = "g/order-web") -> Commit:
+    return Commit(project, f"{day}-{title}", day, title, title, "")
+
+
+def order(order_id: str, title: str = "订单列表筛选优化", progress: Progress | None = None) -> Order:
+    return Order(order_id, title, "数据治理及开发任务", "示例项目", progress)
+
+
+def item(day: str, order_id: str, **overrides) -> dict:
+    base = {
+        "day": day,
+        "orderId": order_id,
+        "task": ["完成订单列表筛选"],
+        "data": ["新增 2 项筛选条件"],
+        "problem": [],
+        "issue": "",
+        "plan": "完成筛选结果联调",
+    }
+    return {**base, **overrides}
+
+
+class FakeAi:
+    """按顺序回放预设的回复，并记下每次收到的消息；回复按两段流式推给回调。"""
+
+    def __init__(self, *replies: dict, thinking: str = "") -> None:
+        self._replies = list(replies)
+        self._thinking = thinking
+        self.calls: list[list[dict]] = []
+
+    def __call__(self, messages: list[dict], on_chunk) -> str:
+        self.calls.append(messages)
+        if self._thinking:
+            on_chunk("thinking", self._thinking)
+        text = json.dumps(self._replies.pop(0), ensure_ascii=False)
+        on_chunk("content", text[: len(text) // 2])
+        on_chunk("content", text)
+        return text
+
+
+def test_material_lists_pending_blocks_and_cleaned_commits():
+    days = [ScheduleDay("2026-10-26", (order("1"),))]
+    commits = [
+        commit("2026-10-27", "feat: 新增订单列表筛选"),
+        commit("2026-10-27", "Merge branch 'dev' into 'main'"),
+    ]
+    material = build_material(days, commits)
+
+    assert material["schedule"][0]["orders"][0]["id"] == "1"
+    assert material["schedule"][0]["orders"][0]["工单标题"] == "订单列表筛选优化"
+    assert material["commits"] == [
+        {"day": "2026-10-27", "project": "g/order-web", "title": "新增订单列表筛选"}
+    ]
+
+
+def test_every_pending_block_gets_a_three_section_memo():
+    days = [ScheduleDay("2026-10-26", (order("1"),)), ScheduleDay("2026-10-27", (order("1"),))]
+    ai = FakeAi({"items": [item("2026-10-26", "1"), item("2026-10-27", "1")]})
+    result = generate(days, [commit("2026-10-27", "新增筛选")], ai)
+
+    progress = result[0].orders[0].progress
+    assert progress.source == "ai"
+    assert progress.memo == "具体任务：完成订单列表筛选\n关键数据：新增 2 项筛选条件\n问题解决过程：无"
+    assert progress.issue == "无"
+    assert progress.plan == "完成筛选结果联调"
+    assert progress.problems == ()
+    assert len(ai.calls) == 1
+
+
+def test_filled_blocks_are_neither_sent_nor_overwritten():
+    filled = Progress(memo="具体任务：已填", issue="无", plan="联调", source="eom")
+    days = [ScheduleDay("2026-10-26", (order("1", progress=filled), order("2", "报表数据梳理")))]
+    ai = FakeAi({"items": [item("2026-10-26", "2")]})
+    result = generate(days, [], ai)
+
+    sent = json.loads(ai.calls[0][-1]["content"])
+    pending_ids = [o["id"] for d in sent["schedule"] for o in d["orders"] if not o.get("已填写")]
+    assert pending_ids == ["2"]
+    assert result[0].orders[0].progress is filled
+    assert result[0].orders[1].progress.source == "ai"
+
+
+def test_failing_blocks_are_retried_once_with_the_reasons():
+    days = [ScheduleDay("2026-10-26", (order("1"), order("2", "报表数据梳理")))]
+    ai = FakeAi(
+        {"items": [item("2026-10-26", "1", task=["修复 getUserInfo 报错"]), item("2026-10-26", "2")]},
+        {"items": [item("2026-10-26", "1", task=["修复用户信息读取报错"])]},
+    )
+    result = generate(days, [], ai)
+
+    assert len(ai.calls) == 2
+    retry = ai.calls[1][-1]["content"]
+    assert "getUserInfo" in retry
+    assert result[0].orders[0].progress.memo.startswith("具体任务：修复用户信息读取报错")
+    assert result[0].orders[0].progress.problems == ()
+
+
+def test_still_failing_after_retry_is_flagged_not_dropped():
+    days = [ScheduleDay("2026-10-26", (order("1"),))]
+    bad = {"items": [item("2026-10-26", "1", task=["修复 getUserInfo 报错"])]}
+    result = generate(days, [], FakeAi(bad, bad))
+
+    progress = result[0].orders[0].progress
+    assert progress.memo.startswith("具体任务：修复 getUserInfo 报错")
+    assert any("getUserInfo" in p for p in progress.problems)
+
+
+def test_missing_block_is_retried_then_flagged():
+    days = [ScheduleDay("2026-10-26", (order("1"),))]
+    result = generate(days, [], FakeAi({"items": []}, {"items": []}))
+
+    progress = result[0].orders[0].progress
+    assert progress.memo == ""
+    assert progress.problems == ("AI 没有生成这一块",)
+
+
+def test_malformed_reply_counts_as_missing_not_a_crash():
+    days = [ScheduleDay("2026-10-26", (order("1"),))]
+
+    def broken(_messages, _on_chunk):
+        return "不是 JSON"
+
+    progress = generate(days, [], broken)[0].orders[0].progress
+    assert progress.problems == ("AI 没有生成这一块",)
+
+
+def test_nothing_pending_skips_the_ai_call():
+    filled = Progress(memo="具体任务：已填", issue="无", plan="联调", source="eom")
+    ai = FakeAi()
+    generate([ScheduleDay("2026-10-26", (order("1", progress=filled),))], [], ai)
+
+    assert ai.calls == []
+
+
+def test_progress_reports_thinking_blocks_written_and_validation():
+    days = [ScheduleDay("2026-10-26", (order("1"), order("2", "报表数据梳理")))]
+    ai = FakeAi({"items": [item("2026-10-26", "1"), item("2026-10-26", "2")]}, thinking="想" * 700)
+    lines: list[str] = []
+    generate(days, [], ai, lines.append)
+
+    assert lines[0] == "AI 生成：等待响应，共 2 块"
+    assert "AI 生成：思考中，已输出 700 字" in lines
+    assert "AI 生成：已写出 2/2 块" in lines
+    assert lines[-1] == "校验：全部通过"
+
+
+def test_progress_announces_the_retry():
+    days = [ScheduleDay("2026-10-26", (order("1"),))]
+    bad = {"items": [item("2026-10-26", "1", task=["修复 getUserInfo 报错"])]}
+    lines: list[str] = []
+    generate(days, [], FakeAi(bad, bad), lines.append)
+
+    assert "校验：1 块不合格，交给 AI 重写" in lines
+    assert "AI 重写：已写出 1/1 块" in lines
+    assert lines[-1] == "校验：1 块仍需复核"
