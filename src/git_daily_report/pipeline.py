@@ -12,7 +12,7 @@ from typing import Callable
 
 from .config import Config
 from .generate import generate, make_completer
-from .models import ScheduleDay
+from .models import Commit, ScheduleDay
 from .sources.eom import EomClient
 from .sources.gitlab import GitlabClient
 
@@ -28,14 +28,14 @@ class RunResult:
     commit_count: int = 0
 
 
-def run(
+def fetch(
     cfg: Config,
     since: date,
     until: date,
     progress: Progress | None = None,
     today: date | None = None,
-) -> RunResult:
-    """拉取并生成区间内每个工单块的进展。"""
+) -> tuple[list[ScheduleDay], list[Commit]]:
+    """拉区间内的排期与写进展用的提交，没有排期就不拉提交。"""
     report = progress or (lambda _: None)
     now = today or date.today()
 
@@ -44,14 +44,27 @@ def run(
     blocks = sum(len(d.orders) for d in days)
     report(f"EOM 排期：{len(days)} 天、{blocks} 个工单块")
     if not days:
-        return RunResult()
+        return [], []
 
     window = (since - timedelta(days=COMMIT_SLACK_DAYS), min(until + timedelta(days=COMMIT_SLACK_DAYS), now))
     report("GitLab 提交：拉取中")
     commits = GitlabClient(cfg.gitlab).list_commits(*window)
     report(f"GitLab 提交：{len({c.project for c in commits})} 个项目、{len(commits)} 条")
+    return list(days), list(commits)
 
-    generated = generate(days, commits, make_completer(cfg.ai), report)
+
+def run(
+    cfg: Config,
+    since: date,
+    until: date,
+    progress: Progress | None = None,
+    today: date | None = None,
+) -> RunResult:
+    """拉取并生成区间内每个工单块的进展。"""
+    days, commits = fetch(cfg, since, until, progress, today)
+    if not days:
+        return RunResult()
+    generated = generate(days, commits, make_completer(cfg.ai), progress)
     return RunResult(days=generated, commit_count=len(commits))
 
 

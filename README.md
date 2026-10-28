@@ -25,7 +25,7 @@ cp .env.example .env
 | --- | --- |
 | `EOM_BASE_URL` / `EOM_TOKEN` | 见下方「获取 EOM token」 |
 | `GITLAB_BASE_URL` / `GITLAB_TOKEN` | `<GitLab 实例>/-/user_settings/personal_access_tokens`，勾 `read_api` |
-| `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | 任意 OpenAI 兼容接口 |
+| `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | 任意 OpenAI 兼容接口；只用 Claude Code 生成时可不填 |
 
 凭证只留在服务端，不下发浏览器，不写入报告，不打印到日志。
 
@@ -59,6 +59,26 @@ uv run dr --port 8080 --no-open  # 指定端口、不开浏览器
 
 工单进展百分比与工时不生成，在 EOM 里填。
 
+### 在 Claude Code 里使用
+
+不配 AI 接口，由本机 Claude Code 自己写进展。工具只拉素材、校验、落盘，结果写进同一份 `output/{周}.json`，照样在网页上复制。
+
+一次性安装，让任意目录都能用：
+
+```bash
+uv tool install --editable .                                    # dr 进入 PATH，.env 与 output/ 仍在本仓库
+ln -s "$PWD/.claude/skills/eom-weekly" ~/.claude/skills/eom-weekly
+```
+
+之后在 Claude Code 里说「写本周 EOM 周报」即可，流程见 [.claude/skills/eom-weekly/SKILL.md](.claude/skills/eom-weekly/SKILL.md)。底层是两个子命令：
+
+```bash
+dr material [--since D --until D]          # 拉排期与提交，存排期，输出规则、素材与待写块
+dr apply items.json [--since D --until D]  # 校验并填入，输出不合格与缺失的块
+```
+
+写完运行 `dr` 打开网页逐块复制。
+
 ## 生成规则
 
 规则写在 [src/git_daily_report/generate_rules.md](src/git_daily_report/generate_rules.md)，就是给 AI 的系统提示：
@@ -78,12 +98,14 @@ AI 的输出不直接信任，先过 [validate.py](src/git_daily_report/validate
 ```text
 EOM 日程表（每天 × 工单）────┐
                             ├─► AI 生成整周 ─► 规则校验 ─► output/{周}.json ─► 网页逐块复制
-GitLab 提交（区间前后 3 天）─┘
+GitLab 提交（区间前后 3 天）─┘       ▲
+                                    └── 或：dr material ─► Claude Code 写 ─► dr apply
 ```
 
 ```text
 src/git_daily_report/
-├── config.py / period.py / pipeline.py / cli.py
+├── config.py / period.py / pipeline.py
+├── cli.py                 # dr 起网页；material / apply 给 skill 用
 ├── models.py              # Commit / Order / Progress / ScheduleDay
 ├── store.py               # 周报文件读写，重新生成直接覆盖
 ├── text.py                # 提交文本清洗
