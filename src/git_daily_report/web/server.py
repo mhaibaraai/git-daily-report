@@ -1,10 +1,10 @@
 """本机网页服务。
 
-日常入口就是这个页面：选区间、拉数、预览、导出、对话都在上面完成，命令行不用
-记。只绑 127.0.0.1，凭证留在服务端，Gitee / GitLab / AI 的请求全由这里发出。
+日常入口就是这个页面：选周、拉取并生成、逐块复制。只绑 127.0.0.1，凭证留在
+服务端，EOM / GitLab / AI 的请求全由这里发出。
 
-用 ThreadingHTTPServer 而不是 HTTPServer——采集与对话都是 SSE 长连接，单线程
-会把后续请求全堵住。
+用 ThreadingHTTPServer 而不是 HTTPServer——生成是 SSE 长连接，单线程会把后续
+请求全堵住。
 """
 
 from __future__ import annotations
@@ -18,11 +18,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from ..config import ALL_SOURCES, Config, ConfigError
+from ..config import Config, ConfigError
+from ..generate import GenerateError
 from ..period import resolve, shortcut
 from ..sources._http import SourceError
-from .llm import Chat
-from .tools import ReportSession, ToolError
+from .session import ReportSession
 
 PAGE = Path(__file__).with_name("page.html")
 
@@ -30,7 +30,6 @@ PAGE = Path(__file__).with_name("page.html")
 def serve(
     cfg: Config,
     output_dir: Path,
-    config_dir: Path,
     since: date,
     until: date,
     *,
@@ -38,13 +37,13 @@ def serve(
     open_browser: bool = True,
 ) -> None:
     """起服务并阻塞，Ctrl-C 退出。"""
-    session = ReportSession(output_dir, config_dir, since, until)
+    session = ReportSession(output_dir, since, until)
     lock = threading.Lock()
     handler = _make_handler(cfg, session, lock)
 
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     url = f"http://127.0.0.1:{server.server_port}/"
-    print(f"日报工作台已启动：{url}\n按 Ctrl-C 退出。")
+    print(f"EOM 周报已启动：{url}\n按 Ctrl-C 退出。")
     if open_browser:
         webbrowser.open(url)
     try:
@@ -79,8 +78,6 @@ def _make_handler(cfg: Config, session: ReportSession, lock: threading.Lock):
                 return self._period(body)
             if path == "/api/sync":
                 return self._stream(lambda: _sync_events(cfg, session, body))
-            if path == "/api/chat":
-                return self._stream(lambda: _chat_events(cfg, session, body))
             self._json(404, {"error": "not found"})
 
         def _period(self, body: dict):
@@ -93,7 +90,7 @@ def _make_handler(cfg: Config, session: ReportSession, lock: threading.Lock):
 
         def _export(self, query: dict):
             with lock:
-                text = session.memo() if query.get("style") == "memo" else session.markdown()
+                text = session.text()
             headers = {}
             if query.get("download"):
                 name = f"{session.since}_{session.until}.md"
@@ -147,14 +144,7 @@ def _make_handler(cfg: Config, session: ReportSession, lock: threading.Lock):
 
 
 def _state(cfg: Config, session: ReportSession) -> dict:
-    report = session.read_report()
-    return {
-        "range": report["range"],
-        "days": report["days"],
-        "stats": session.stats(),
-        "gaps": cfg.missing(ALL_SOURCES),
-        "ai": cfg.ai.ready,
-    }
+    return {**session.state(), "gaps": cfg.missing()}
 
 
 def _period_from(body: dict) -> tuple[date, date]:
@@ -171,7 +161,7 @@ def _sync_events(cfg: Config, session: ReportSession, body: dict) -> Iterator[di
     try:
         if body.get("since") or body.get("until"):
             session.set_period(*_period_from(body))
-        cfg.require(("gitee",))  # Gitee 提供任务容器，缺了没得可归
+        cfg.require()
     except (ValueError, ConfigError) as exc:
         yield {"type": "error", "message": str(exc)}
         return
@@ -180,9 +170,9 @@ def _sync_events(cfg: Config, session: ReportSession, body: dict) -> Iterator[di
 
     def work() -> None:
         try:
-            summary = session.sync(cfg, ALL_SOURCES, channel.put)
+            summary = session.sync(cfg, channel.put)
             channel.put(("summary", summary))
-        except (SourceError, ValueError) as exc:
+        except (SourceError, GenerateError, ValueError) as exc:
             channel.put(("error", str(exc)))
         finally:
             channel.put(_DONE)
@@ -204,21 +194,7 @@ def _sync_events(cfg: Config, session: ReportSession, body: dict) -> Iterator[di
             yield {"type": "progress", "text": item}
 
     worker.join()
-    yield {"type": "done", "stats": session.stats()}
-
-
-def _chat_events(cfg: Config, session: ReportSession, body: dict) -> Iterator[dict]:
-    message = (body.get("message") or "").strip()
-    if not message:
-        yield {"type": "error", "message": "说点什么吧"}
-        return
-    try:
-        chat = Chat(session, cfg)
-        for event in chat.run([{"role": "user", "content": message}]):
-            yield {"type": event.type, **event.data}
-    except (ToolError, SourceError) as exc:
-        yield {"type": "error", "message": str(exc)}
-        yield {"type": "done", "stats": session.stats()}
+    yield {"type": "done"}
 
 
 def _split(raw: str) -> tuple[str, dict]:

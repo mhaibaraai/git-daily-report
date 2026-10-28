@@ -3,6 +3,5 @@ __pycache__/
 *.pyc
 .venv/
 output/
-config/project-mapping.json
 .coverage
 .pytest_cache/

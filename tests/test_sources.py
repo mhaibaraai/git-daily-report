@@ -1,4 +1,4 @@
-"""Gitee 与 GitLab 客户端的分页、时间边界与错误处理。"""
+"""GitLab 客户端的分页、时间边界与错误处理。"""
 
 from __future__ import annotations
 
@@ -8,77 +8,10 @@ import pytest
 import requests
 import responses
 
-from git_daily_report.config import GiteeConfig, GitlabConfig
-from git_daily_report.sources.gitee import GiteeClient, GiteeError
+from git_daily_report.config import GitlabConfig
 from git_daily_report.sources.gitlab import GitlabClient, GitlabError
 
-GITEE_URL = "https://gitee.com/api/v5/enterprises/acme/issues"
-GITEE_CFG = GiteeConfig(access_token="T", enterprise="acme", assignee="me")
 GITLAB_CFG = GitlabConfig(base_url="http://gitlab.test", token="T")
-
-
-def issue(number: str, updated: str, finished: str | None = None, program: str | None = "项目甲"):
-    return {
-        "number": number,
-        "title": f"任务{number}",
-        "state": "open",
-        "created_at": "2026-08-01T09:00:00+08:00",
-        "updated_at": updated,
-        "finished_at": finished,
-        "deadline": None,
-        "program": {"name": program} if program else None,
-        "html_url": "",
-    }
-
-
-@responses.activate
-def test_gitee_uses_since_and_sends_token():
-    responses.add(responses.GET, GITEE_URL, json=[], headers={"total_page": "1"})
-    GiteeClient(GITEE_CFG).list_enterprise_issues(date(2026, 8, 1), date(2026, 8, 31))
-
-    request = responses.calls[0].request
-    assert request.headers["Authorization"] == "token T"
-    assert "since=2026-08-01T00%3A00%3A00%2B08%3A00" in request.url
-    assert "assignee=me" in request.url
-    # 上界不能作为请求参数，接口只认 since
-    assert "created_at" not in request.url
-
-
-@responses.activate
-def test_gitee_paginates_by_total_page():
-    responses.add(
-        responses.GET, GITEE_URL, json=[issue("A", "2026-08-05T10:00:00+08:00")],
-        headers={"total_page": "2"},
-    )
-    responses.add(
-        responses.GET, GITEE_URL, json=[issue("B", "2026-08-06T10:00:00+08:00")],
-        headers={"total_page": "2"},
-    )
-    items = GiteeClient(GITEE_CFG).list_enterprise_issues(date(2026, 8, 1), date(2026, 8, 31))
-    assert [i.number for i in items] == ["A", "B"]
-    assert len(responses.calls) == 2
-
-
-@responses.activate
-def test_gitee_filters_upper_bound_locally():
-    responses.add(
-        responses.GET,
-        GITEE_URL,
-        json=[
-            issue("IN", "2026-08-31T23:59:59+08:00"),
-            issue("OUT", "2026-09-01T00:00:01+08:00"),
-        ],
-        headers={"total_page": "1"},
-    )
-    items = GiteeClient(GITEE_CFG).list_enterprise_issues(date(2026, 8, 1), date(2026, 8, 31))
-    assert [i.number for i in items] == ["IN"]
-
-
-@responses.activate
-def test_gitee_permission_error_mentions_scope():
-    responses.add(responses.GET, GITEE_URL, status=403)
-    with pytest.raises(GiteeError, match="enterprises"):
-        GiteeClient(GITEE_CFG).list_enterprise_issues(date(2026, 8, 1), date(2026, 8, 31))
 
 
 def event(day: str, project_id: int, count: int, title: str):
@@ -269,8 +202,8 @@ def test_http_raises_after_exhausting_retries(monkeypatch):
 
     from git_daily_report.sources._http import SourceError, request
 
-    with pytest.raises(SourceError, match="Gitee"):
-        request("GET", "http://down.test/x", source="Gitee")
+    with pytest.raises(SourceError, match="GitLab"):
+        request("GET", "http://down.test/x", source="GitLab")
 
 
 def merge_commit(sha: str, day: str, branch: str, parents: list[str]):

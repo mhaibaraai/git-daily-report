@@ -1,78 +1,69 @@
-"""取数与归并的编排层。
+"""拉排期、拉提交、调 AI 的编排层。
 
-主干是 git 活动：Gitee 企业工作项提供任务容器，GitLab 逐条提交提供明细。
-不依赖任何工单，随时可跑。GitLab 是内网实例，脱离内网时该源自动跳过。
+以 EOM 排期为准：没有排期就不必再拉提交、调 AI。提交窗口向前多取几天，
+用来覆盖「提交推迟」——当天的工作常常在后面几天才推上去。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
-from pathlib import Path
-from typing import Callable, Sequence
+from datetime import date, timedelta
+from typing import Callable
 
 from .config import Config
-from .linking import matcher
-from .models import Commit, DayReport, WorkItem
-from .report import build_days
-from .sources.gitee import GiteeClient
-from .sources.gitlab import GitlabClient, GitlabUnreachable
+from .generate import generate, make_completer
+from .models import ScheduleDay
+from .sources.eom import EomClient
+from .sources.gitlab import GitlabClient
 
 Progress = Callable[[str], None]
 
+# 提交推迟或提前推送的容差
+COMMIT_SLACK_DAYS = 3
+
 
 @dataclass
-class SyncResult:
-    days: list[DayReport] = field(default_factory=list)
-    skipped_sources: list[str] = field(default_factory=list)
-    item_count: int = 0
+class RunResult:
+    days: list[ScheduleDay] = field(default_factory=list)
     commit_count: int = 0
 
-    @property
-    def point_count(self) -> int:
-        return sum(len(d.points) for d in self.days)
 
-    def review_count(self, needs_review: frozenset[str]) -> int:
-        return sum(1 for d in self.days for p in d.points if p.confidence in needs_review)
-
-
-def collect(
+def run(
     cfg: Config,
     since: date,
     until: date,
-    sources: Sequence[str],
-    config_dir: Path,
     progress: Progress | None = None,
-) -> SyncResult:
-    """按启用的数据源拉数并归并成每日工作点。"""
+    today: date | None = None,
+) -> RunResult:
+    """拉取并生成区间内每个工单块的进展。"""
     report = progress or (lambda _: None)
-    result = SyncResult()
+    now = today or date.today()
 
-    items: list[WorkItem] = []
-    if "gitee" in sources:
-        items = GiteeClient(cfg.gitee).list_enterprise_issues(since, until)
-        result.item_count = len(items)
-        report(f"Gitee 工作项 {len(items)} 条")
+    report("EOM 排期：拉取中")
+    days = EomClient(cfg.eom).schedule(since, until, today=now)
+    blocks = sum(len(d.orders) for d in days)
+    report(f"EOM 排期：{len(days)} 天、{blocks} 个工单块")
+    if not days:
+        return RunResult()
 
-    commits: list[Commit] = []
-    if "gitlab" in sources:
-        try:
-            commits = GitlabClient(cfg.gitlab).list_commits(since, until)
-            result.commit_count = len(commits)
-            projects = len({c.project for c in commits})
-            report(f"GitLab {projects} 个项目、{len(commits)} 条提交")
-        except GitlabUnreachable as exc:
-            result.skipped_sources.append(f"GitLab（{exc}）")
-            report("GitLab 不可达，已跳过")
+    window = (since - timedelta(days=COMMIT_SLACK_DAYS), min(until + timedelta(days=COMMIT_SLACK_DAYS), now))
+    report("GitLab 提交：拉取中")
+    commits = GitlabClient(cfg.gitlab).list_commits(*window)
+    report(f"GitLab 提交：{len({c.project for c in commits})} 个项目、{len(commits)} 条")
 
-    result.days = build_days(items, commits, since, until, matcher.load_mapping(config_dir))
-    return result
+    generated = generate(days, commits, make_completer(cfg.ai), report)
+    return RunResult(days=generated, commit_count=len(commits))
 
 
-def summarize(result: SyncResult, needs_review: frozenset[str]) -> str:
-    """给终端与页面顶栏一句话总结。"""
-    review = result.review_count(needs_review)
-    lines = [f"共 {result.point_count} 个工作点，其中 {review} 个待确认归属。"]
-    lines.append(f"素材：工作项 {result.item_count} 条、提交 {result.commit_count} 条。")
-    lines.extend(f"已跳过：{skipped}" for skipped in result.skipped_sources)
-    return "\n".join(lines)
+def summarize(result: RunResult) -> str:
+    """给页面顶栏一句话总结。"""
+    orders = [o for d in result.days for o in d.orders]
+    if not orders:
+        return "这个区间在 EOM 日程表上没有排工单。"
+    generated = [o for o in orders if o.progress and o.progress.source == "ai"]
+    flagged = sum(1 for o in generated if o.progress.problems)
+    filled = len(orders) - len(generated)
+    return (
+        f"共 {len(result.days)} 天、{len(orders)} 个工单块：生成 {len(generated)} 块"
+        f"（{flagged} 块需复核），EOM 已填 {filled} 块；参考提交 {result.commit_count} 条。"
+    )

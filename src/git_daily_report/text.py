@@ -1,13 +1,12 @@
 """提交文本的清洗规则。
 
-合并提交没有信息量，conventional commits 的类型前缀是给机器看的，两者都不该
-出现在给人读的日报里。抽不出内容时留空，不做任何推测填充。
+合并提交没有信息量，conventional commits 的类型前缀是给机器看的，喂给 AI 之前
+先清掉，省得它照抄进日报。
 """
 
 from __future__ import annotations
 
 import re
-from typing import Iterable
 
 _MERGE_COMMIT = re.compile(r"^Merge (branch|remote-tracking|pull request)", re.IGNORECASE)
 _COMMIT_TYPE_PREFIX = re.compile(
@@ -38,21 +37,3 @@ def headline(message: str) -> str:
     """取提交信息的首行。"""
     stripped = (message or "").strip()
     return stripped.splitlines()[0] if stripped else ""
-
-
-def dedupe(values: Iterable[str]) -> tuple[str, ...]:
-    """按出现顺序去重，丢弃空值。"""
-    seen: list[str] = []
-    for value in values:
-        if value and value not in seen:
-            seen.append(value)
-    return tuple(seen)
-
-
-def entries_from_commits(messages: Iterable[str]) -> tuple[str, ...]:
-    """把提交信息批量清洗成日报明细。"""
-    return dedupe(
-        clean_entry(strip_commit_prefix(head))
-        for head in (headline(m) for m in messages)
-        if head and not is_merge_commit(head)
-    )

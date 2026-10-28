@@ -1,7 +1,7 @@
 """配置加载与校验。
 
-所有凭证只从 .env 读取，按本次启用的数据源分别校验，缺失即中止。凭证只留在
-服务端，不写入报告、不打印到日志、不下发浏览器。
+所有凭证只从 .env 读取，缺失即在页面上列出。凭证只留在服务端，不写入报告、
+不打印到日志、不下发浏览器。
 """
 
 from __future__ import annotations
@@ -15,11 +15,8 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = PROJECT_ROOT / ".env"
 OUTPUT_DIR = PROJECT_ROOT / "output"
-CONFIG_DIR = PROJECT_ROOT / "config"
 
-ALL_SOURCES = ("gitee", "gitlab")
-
-DEFAULT_AI_MODEL = "qwen-plus"
+DEFAULT_AI_MODEL = "qwen3.8-flash"
 
 
 class ConfigError(RuntimeError):
@@ -27,14 +24,15 @@ class ConfigError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class GiteeConfig:
-    access_token: str
-    enterprise: str
-    assignee: str
+class GitlabConfig:
+    base_url: str
+    token: str
 
 
 @dataclass(frozen=True)
-class GitlabConfig:
+class EomConfig:
+    """EOM 只能在企微内登录，token 需在企微调试模式下用网页检查器取出来。"""
+
     base_url: str
     token: str
 
@@ -47,35 +45,28 @@ class AiConfig:
     api_key: str
     model: str
 
-    @property
-    def ready(self) -> bool:
-        return bool(self.api_key)
-
 
 @dataclass(frozen=True)
 class Config:
-    gitee: GiteeConfig
     gitlab: GitlabConfig
+    eom: EomConfig
     ai: AiConfig
 
-    def missing(self, sources: tuple[str, ...]) -> list[str]:
-        """列出指定数据源缺哪些凭证，顺带说明去哪里拿。"""
+    def missing(self) -> list[str]:
+        """列出缺哪些凭证，顺带说明去哪里拿。"""
         gaps: list[str] = []
-        if "gitee" in sources:
-            if not self.gitee.access_token:
-                gaps.append(
-                    "GITEE_ACCESS_TOKEN（gitee.com/profile/personal_access_tokens，勾 enterprises）"
-                )
-            if not self.gitee.enterprise:
-                gaps.append("GITEE_ENTERPRISE（企业主页 gitee.com/enterprises/<这一段>）")
-            if not self.gitee.assignee:
-                gaps.append("GITEE_ASSIGNEE（你的 Gitee 登录名）")
-        if "gitlab" in sources and not self.gitlab.token:
-            gaps.append("GITLAB_TOKEN（GitLab 实例的 personal access token，勾 read_api）")
+        if not self.eom.base_url:
+            gaps.append("EOM_BASE_URL（EOM 后端接口地址，见 README）")
+        if not self.eom.token:
+            gaps.append("EOM_TOKEN（企微内打开 EOM，开启 webView 元素审查后复制请求头 token，见 README）")
+        if not self.gitlab.base_url or not self.gitlab.token:
+            gaps.append("GITLAB_BASE_URL / GITLAB_TOKEN（GitLab personal access token，勾 read_api）")
+        if not self.ai.api_key:
+            gaps.append("AI_API_KEY（任意 OpenAI 兼容接口，配 AI_BASE_URL 与 AI_MODEL）")
         return gaps
 
-    def require(self, sources: tuple[str, ...]) -> None:
-        gaps = self.missing(sources)
+    def require(self) -> None:
+        gaps = self.missing()
         if gaps:
             raise ConfigError(
                 "缺少必要配置：\n  - " + "\n  - ".join(gaps) + f"\n请在 {ENV_PATH} 中补齐。"
@@ -86,14 +77,13 @@ def load_config(env_path: Path | None = None) -> Config:
     """读取 .env 并组装配置对象，不做校验。"""
     load_dotenv(env_path or ENV_PATH, override=False)
     return Config(
-        gitee=GiteeConfig(
-            access_token=os.getenv("GITEE_ACCESS_TOKEN", "").strip(),
-            enterprise=os.getenv("GITEE_ENTERPRISE", "").strip(),
-            assignee=os.getenv("GITEE_ASSIGNEE", "").strip(),
-        ),
         gitlab=GitlabConfig(
             base_url=os.getenv("GITLAB_BASE_URL", "").strip().rstrip("/"),
             token=os.getenv("GITLAB_TOKEN", "").strip(),
+        ),
+        eom=EomConfig(
+            base_url=os.getenv("EOM_BASE_URL", "").strip().rstrip("/"),
+            token=os.getenv("EOM_TOKEN", "").strip(),
         ),
         ai=AiConfig(
             base_url=os.getenv("AI_BASE_URL", "").strip(),
@@ -101,14 +91,3 @@ def load_config(env_path: Path | None = None) -> Config:
             model=os.getenv("AI_MODEL", DEFAULT_AI_MODEL).strip() or DEFAULT_AI_MODEL,
         ),
     )
-
-
-def parse_sources(raw: str | None) -> tuple[str, ...]:
-    """解析 --sources 参数，未指定时启用全部。"""
-    if not raw:
-        return ALL_SOURCES
-    names = tuple(n.strip() for n in raw.split(",") if n.strip())
-    unknown = [n for n in names if n not in ALL_SOURCES]
-    if unknown:
-        raise ConfigError(f"未知数据源：{', '.join(unknown)}；可选：{', '.join(ALL_SOURCES)}")
-    return names
