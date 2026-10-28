@@ -14,42 +14,33 @@ from urllib.request import Request, urlopen
 import pytest
 
 from git_daily_report import store
-from git_daily_report.config import AiConfig, Config, GiteeConfig, GitlabConfig
-from git_daily_report.models import Commit, DayReport, WorkPoint
+from git_daily_report.config import AiConfig, Config, EomConfig, GitlabConfig
+from git_daily_report.models import Order, Progress, ScheduleDay
 from git_daily_report.web import server as web_server
-from git_daily_report.web.tools import ReportSession
+from git_daily_report.web.session import ReportSession
 
 FULL = Config(
-    gitee=GiteeConfig(access_token="T", enterprise="E", assignee="me"),
     gitlab=GitlabConfig(base_url="http://gitlab.test", token="T"),
+    eom=EomConfig(base_url="http://eom.test", token="T"),
     ai=AiConfig(base_url="", api_key="K", model="m"),
 )
 BLANK = Config(
-    gitee=GiteeConfig(access_token="", enterprise="E", assignee=""),
     gitlab=GitlabConfig(base_url="", token=""),
+    eom=EomConfig(base_url="http://eom.test", token=""),
     ai=AiConfig(base_url="", api_key="", model="m"),
 )
+SINCE, UNTIL = date(2026, 10, 26), date(2026, 11, 1)
 
 
 def sample_days():
-    commit = Commit("g/应急平台", "s1", "2026-08-10", "feat: 图层切换", "feat: 图层切换", "")
-    return [
-        DayReport(
-            day="2026-08-10",
-            points=(
-                WorkPoint(
-                    id="2026-08-10/A",
-                    day="2026-08-10",
-                    title="态势图层重构",
-                    entries=("图层切换",),
-                    confidence="ambiguous",
-                    item_number="A",
-                    candidates=("A", "B"),
-                    commits=(commit,),
-                ),
-            ),
-        )
-    ]
+    progress = Progress(
+        memo="具体任务：完成筛选\n关键数据：无\n问题解决过程：无",
+        issue="无",
+        plan="联调",
+        source="ai",
+        problems=("含代码词：dev",),
+    )
+    return [ScheduleDay("2026-10-26", (Order("1", "订单列表筛选优化", "任务", "项目", progress),))]
 
 
 class Client:
@@ -85,9 +76,8 @@ class Client:
 @pytest.fixture
 def client(tmp_path, request):
     cfg = getattr(request, "param", FULL)
-    since, until = date(2026, 8, 1), date(2026, 8, 31)
-    store.save_days(store.report_path(tmp_path, since, until), since, until, sample_days())
-    session = ReportSession(tmp_path, tmp_path, since, until)
+    store.save_days(store.report_path(tmp_path, SINCE, UNTIL), SINCE, UNTIL, sample_days())
+    session = ReportSession(tmp_path, SINCE, UNTIL)
 
     handler = web_server._make_handler(cfg, session, threading.Lock())
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -106,57 +96,54 @@ def test_root_serves_a_self_contained_page(client):
     status, body = api.get("/")
 
     assert status == 200
-    assert "<title>每日工作点</title>" in body
+    assert "<title>EOM 周报</title>" in body
     # 页面不拉任何外部资源，离线也能用
     assert "http://" not in body.replace("http://127.0.0.1", "")
     assert "<script" in body and "src=" not in body.split("<script")[1][:40]
 
 
-def test_state_carries_range_points_and_review_count(client):
+def test_state_carries_range_days_and_progress(client):
     api, _ = client
-    _status, body = api.get("/api/state")
-    state = json.loads(body)
+    state = json.loads(api.get("/api/state")[1])
 
-    assert state["range"] == {"since": "2026-08-01", "until": "2026-08-31"}
-    assert state["stats"] == {"points": 1, "review": 1, "days": 1}
-    assert state["days"][0]["points"][0]["note"] == "⚠ 归属存疑：A / B"
-    assert state["ai"] is True
+    assert state["range"] == {"since": "2026-10-26", "until": "2026-11-01"}
+    order = state["days"][0]["orders"][0]
+    assert order["title"] == "订单列表筛选优化"
+    assert order["progress"]["memo"].startswith("具体任务：完成筛选")
+    assert order["progress"]["problems"] == ["含代码词：dev"]
     assert state["gaps"] == []
 
 
 @pytest.mark.parametrize("client", [BLANK], indirect=True)
-def test_missing_credentials_surface_on_the_page_not_only_the_terminal(client):
+def test_missing_credentials_surface_on_the_page(client):
     api, _ = client
     state = json.loads(api.get("/api/state")[1])
 
-    assert any("GITEE_ACCESS_TOKEN" in gap for gap in state["gaps"])
-    assert state["ai"] is False
+    assert any("EOM_TOKEN" in gap for gap in state["gaps"])
 
 
-def test_shortcut_switches_the_period(client):
+def test_shortcut_switches_to_last_week(client):
     api, session = client
-    api.post("/api/period", {"shortcut": "last-month"})
+    api.post("/api/period", {"shortcut": "last-week"})
 
-    assert session.since.day == 1
-    assert session.until > session.since
+    assert session.since.weekday() == 0
+    assert (session.until - session.since).days == 6
 
 
 def test_bad_period_is_a_400_not_a_stack_trace(client):
     api, _ = client
     with pytest.raises(Exception) as excinfo:
-        api.post("/api/period", {"since": "2026-08-10", "until": "2026-08-01"})
+        api.post("/api/period", {"since": "2026-10-30", "until": "2026-10-26"})
 
     assert "400" in str(excinfo.value)
 
 
-def test_export_serves_both_views(client):
+def test_export_is_the_full_week_text(client):
     api, _ = client
-    _status, md = api.get("/api/export?style=md")
-    _status, memo = api.get("/api/export?style=memo")
+    _status, text = api.get("/api/export")
 
-    assert md.startswith("## 2026-08-10")
-    assert "⚠" not in md  # 复制出去的正文不带标记
-    assert "具体任务：图层切换" in memo
+    assert text.startswith("## 2026-10-26\n### 订单列表筛选优化\n具体任务：完成筛选")
+    assert "明日计划：联调" in text
 
 
 def test_download_sets_a_filename(client):
@@ -170,60 +157,41 @@ def test_sync_without_credentials_reports_instead_of_crashing(client):
     events = api.events("/api/sync", {})
 
     assert events[0]["type"] == "error"
-    assert "GITEE_ACCESS_TOKEN" in events[0]["message"]
+    assert "EOM_TOKEN" in events[0]["message"]
 
 
 def test_sync_streams_progress_then_summary_then_done(client, monkeypatch):
     api, _ = client
 
-    def fake_sync(_self, _cfg, _sources, progress=None):
-        progress("Gitee 工作项 3 条")
-        progress("GitLab 2 个项目、7 条提交")
-        return "共 2 个工作点，其中 0 个待确认归属。"
+    def fake_sync(_self, _cfg, progress=None):
+        progress("EOM 排期 5 天、10 个工单块")
+        progress("AI 生成中…")
+        return "已生成 10 块，1 块需复核。"
 
     monkeypatch.setattr(ReportSession, "sync", fake_sync)
     events = api.events("/api/sync", {})
 
     assert [e["type"] for e in events] == ["progress", "progress", "summary", "done"]
-    assert events[0]["text"] == "Gitee 工作项 3 条"
-    assert events[3]["stats"]["points"] == 1
+    assert events[0]["text"] == "EOM 排期 5 天、10 个工单块"
 
 
-def test_gitlab_unreachable_is_a_progress_line_not_a_failure(client, monkeypatch):
+def test_source_errors_are_streamed_as_errors(client, monkeypatch):
     api, _ = client
+    from git_daily_report.sources.eom import EomAuthError
 
-    def fake_sync(_self, _cfg, _sources, progress=None):
-        progress("Gitee 工作项 3 条")
-        progress("GitLab 不可达，已跳过")
-        return "已跳过：GitLab"
+    def fake_sync(_self, _cfg, progress=None):
+        raise EomAuthError("EOM token 已失效，请更新 EOM_TOKEN")
 
     monkeypatch.setattr(ReportSession, "sync", fake_sync)
     events = api.events("/api/sync", {})
 
-    assert not any(e["type"] == "error" for e in events)
-    assert any("不可达" in e.get("text", "") for e in events)
-
-
-def test_empty_chat_message_is_rejected(client):
-    api, _ = client
-    events = api.events("/api/chat", {"message": "  "})
-
-    assert events[0]["type"] == "error"
-
-
-@pytest.mark.parametrize("client", [BLANK], indirect=True)
-def test_chat_without_api_key_explains_itself(client):
-    api, _ = client
-    events = api.events("/api/chat", {"message": "帮我合并"})
-
-    assert events[0]["type"] == "error"
-    assert "AI_API_KEY" in events[0]["message"]
+    assert events[0] == {"type": "error", "message": "EOM token 已失效，请更新 EOM_TOKEN"}
     assert events[-1]["type"] == "done"
 
 
-def test_unknown_route_is_404(client):
+def test_chat_route_is_gone(client):
     api, _ = client
     with pytest.raises(Exception) as excinfo:
-        api.get("/api/nope")
+        api.post("/api/chat", {"message": "hi"})
 
     assert "404" in str(excinfo.value)
