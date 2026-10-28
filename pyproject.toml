@@ -1,7 +1,7 @@
 [project]
 name = "git-daily-report"
 version = "0.1.0"
-description = "从 Gitee 工作项与 GitLab 提交汇总每日工作点，在本地网页里审核与改写"
+description = "按 EOM 日程表与 GitLab 提交，用 AI 生成每周的工单进展"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31",
