@@ -1,6 +1,6 @@
 # git-daily-report
 
-按 EOM 日程表与 GitLab 提交，用 AI 生成每周的工单进展，在本机网页里逐块复制，粘回 EOM「提交日程表」。
+按 EOM 日程表与 GitLab 提交，用 AI 生成每周的工单进展、完成百分比和工时，在本机网页核对后，通过接口一键提交到 EOM。
 
 以 **EOM 日程表为准**：某天排了哪些工单，就给每个工单出一份进展；节假日与调休休息日在日程表上没有工单，自然不会出现。GitLab 提交只是素材——提交推迟、某天缺失都很常见，AI 会把相邻几天的提交拆开、按阶段延展，保证每个工单每天都有产出。
 
@@ -8,6 +8,8 @@
 具体任务：完成订单状态回写；补充异常记录标记
 关键数据：覆盖 12 个门店
 问题解决过程：无
+工单进展：65%（估算，可调整）
+当日工时：4.5h（估算，可调整）
 ```
 
 > 个人自用工具，写死了两个前提：工时填报在公司内部的 **EOM**（企微内登录），代码在**自建 GitLab** 上。
@@ -25,7 +27,7 @@ cp .env.example .env
 | --- | --- |
 | `EOM_BASE_URL` / `EOM_TOKEN` | 见下方「获取 EOM token」 |
 | `GITLAB_BASE_URL` / `GITLAB_TOKEN` | `<GitLab 实例>/-/user_settings/personal_access_tokens`，勾 `read_api` |
-| `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | 任意 OpenAI 兼容接口；只用 Claude Code 生成时可不填 |
+| `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | 任意 OpenAI 兼容接口；由 Codex 或 Claude Code 生成时可不填 |
 
 凭证只留在服务端，不下发浏览器，不写入报告，不打印到日志。
 
@@ -55,29 +57,58 @@ uv run dr --port 8080 --no-open  # 指定端口、不开浏览器
 - 点「拉取并生成」：拉 EOM 排期 → 拉 GitLab 提交 → AI 生成，进度实时显示
 - 按天、按工单一张卡片，「今日进展」「存在问题」「明日计划」各带一个复制按钮，对应 EOM 弹窗里的同名输入框
 - 「今日进展」粘进 EOM 后点「自动编排」即可拆成三项
+- 每张卡片展示累计完成百分比、当日工时；生成值标为估算，可以修改后保存
+- 每天默认按工作量分满 7.5h，扣除 EOM 已填工时；可手动调低，所有工单合计不得超过 7.5h
+- 点「一键提交当前区间」通过接口按天提交，已在 EOM 填写的日报跳过；生成与提交互相独立
 - 底栏「复制全文」「下载 .md」导出整周
 
-工单进展百分比与工时不生成，在 EOM 里填。
+查看本地报告不需要 AI 或 GitLab 配置，提交只需要 EOM 配置。缺少百分比、工时或存在校验问题的日期不能提交，其他日期可以继续。
 
-### 在 Claude Code 里使用
+### 在 Codex 或 Claude Code 里使用
 
-不配 AI 接口，由本机 Claude Code 自己写进展。工具只拉素材、校验、落盘，结果写进同一份 `output/{周}.json`，照样在网页上复制。
+可以直接在 Codex 使用。仓库的 [.agents/skills/eom-weekly/SKILL.md](.agents/skills/eom-weekly/SKILL.md) 是 Codex 技能入口，由当前助手自己写进展，不需要单独的 AI 接口。结果写入同一份 `output/{周}.json`，可在网页查看、调整和提交。
 
 一次性安装，让任意目录都能用：
 
 ```bash
 uv tool install --editable .                                    # dr 进入 PATH，.env 与 output/ 仍在本仓库
+ln -s "$PWD/.agents/skills/eom-weekly" ~/.agents/skills/eom-weekly   # Codex；已有同名技能时先检查，勿覆盖
 ln -s "$PWD/.claude/skills/eom-weekly" ~/.claude/skills/eom-weekly
 ```
 
-之后在 Claude Code 里说「写本周 EOM 周报」即可，流程见 [.claude/skills/eom-weekly/SKILL.md](.claude/skills/eom-weekly/SKILL.md)。底层是两个子命令：
+之后说「写本周 EOM 周报」即可。普通写周报只生成；明确要求「提交到 EOM」时才提交。Claude Code 入口见 [.claude/skills/eom-weekly/SKILL.md](.claude/skills/eom-weekly/SKILL.md)。底层命令：
 
 ```bash
 dr material [--since D --until D]          # 拉排期与提交，存排期，输出规则、素材与待写块
 dr apply items.json [--since D --until D]  # 校验并填入，输出不合格与缺失的块
+dr amend [--since D --until D]             # 按各工单 ID 独立重排已填百分比，保存待核对
+dr submit [--since D --until D] --dry-run # 读取最新 EOM 排期并预检，不写入
+dr submit [--since D --until D]           # 按天提交本地报告
 ```
 
-写完运行 `dr` 打开网页逐块复制。
+`apply` 输入的每条记录增加 `rate` 与 `hours` 数值，例如 `"rate": 65, "hours": 4.5`。同工单完成百分比按日期不得倒退；拉取排期时读取工单开始月至今的已填进度作为上下界，包含所选区间之外的记录，这些上下文日期不会被提交。旧报告仍可查看，缺少这两个字段时需先补齐。
+
+工单 ID 是百分比的唯一分组依据。不同 ID 即使标题、项目、任务或人员相同，也各自按自身排期从 0–100 计算，不继承其他 ID 的百分比；只有同一 ID 的跨日记录需要衔接且不得倒退。新 ID 的首日可按已完成工作估算为大于 0，无需强制填 0。
+
+### 修正已填百分比
+
+已填百分比需要重算时，用 `dr amend` 按每个工单 ID 自身的全部排期日独立线性分配到 100%，不把同标题的其他 ID 算入分母。只改百分比，工时与文字保持 EOM 原样；起始日期须覆盖当前工单 ID 的排期首日，无需覆盖其他 ID。
+
+```bash
+dr amend --since 2026-10-08 --until 2026-10-20          # 保存为待修正，页面标「待修正，原 X%」
+dr submit --since 2026-10-08 --until 2026-10-20 --dry-run
+dr submit --since 2026-10-08 --until 2026-10-20         # 按日报 ID 覆盖（op=8），回读核实
+```
+
+网页切到同一区间可逐条调整百分比，工时只读；改回原值即撤销该条修正。提交前若 EOM 里的百分比已被改动，该日阻止提交。修正写入后，同一 ID 的后续日期重新拉取生成即可按新进度衔接，其他 ID 不受影响。
+
+提交会返回逐日结果；存在失败、冲突、阻止或待核实日期时命令退出码为 1。遇到超时、断线会回读 EOM 核实，仍无法确认则保存待核实记录并暂停后续日期，不自动重发。人工核对后，可在网页选择主动重试，或运行：
+
+```bash
+dr submit [--since D --until D] --retry-unknown
+```
+
+主动重试仍先回读，只重试确认未出现日报的待核实批次；存在内容冲突或部分写入时保留核实状态。凭据只从配置读取，不把抓包中的 token 写入代码或报告。
 
 ## 生成规则
 
@@ -88,8 +119,9 @@ dr apply items.json [--since D --until D]  # 校验并填入，输出不合格�
 - 可以拆分、延展相邻日期的提交，不能编造提交里没有的功能
 - 只用业务语言，禁止文件名、函数名、英文标识符、路径、分支名、提交前缀
 - 三项中没有内容的写「无」；关键数据只写能从提交里数出来的量
+- 自动估算累计完成百分比和各工单工时，默认每天分满 7.5h；已填工时必须计入当日上限
 
-AI 的输出不直接信任，先过 [validate.py](src/git_daily_report/validate.py) 的规则校验：缺块、具体任务为空、明日计划为空、含代码化描述。不合格的块带着原因让 AI 重写一次，仍不合格的保留原文、卡片标红写明原因，不阻塞其余的块。
+AI 的输出先过 [validate.py](src/git_daily_report/validate.py) 校验：必填项、代码化描述、百分比、跨日进度及整日工时。不合格的块带着原因让 AI 重写一次；局部重写也会重算整天。仍不合格的保留原文并标红，该日期不能提交。
 
 已经在 EOM 里填过的工单块原样展示（标「EOM 已填」），不会重新生成。
 
@@ -97,21 +129,26 @@ AI 的输出不直接信任，先过 [validate.py](src/git_daily_report/validate
 
 ```text
 EOM 日程表（每天 × 工单）────┐
-                            ├─► AI 生成整周 ─► 规则校验 ─► output/{周}.json ─► 网页逐块复制
+                            ├─► AI 生成整周 ─► 规则校验 ─► output/{周}.json ─► 网页调整 / 导出
 GitLab 提交（区间前后 3 天）─┘       ▲
-                                    └── 或：dr material ─► Claude Code 写 ─► dr apply
+                                    └── 或：dr material ─► Codex / Claude Code 写 ─► dr apply
+                                                                  │
+                                  dr submit / 网页提交 ◄────────────┘
+                                    └── 最新排期预检 ─► commitReport ─► 回读核实
 ```
 
 ```text
 src/git_daily_report/
 ├── config.py / period.py / pipeline.py
-├── cli.py                 # dr 起网页；material / apply 给 skill 用
+├── cli.py                 # dr 起网页；material / apply / submit 给技能用
 ├── models.py              # Commit / Order / Progress / ScheduleDay
 ├── store.py               # 周报文件读写，重新生成直接覆盖
 ├── text.py                # 提交文本清洗
 ├── generate.py            # 组素材、调 AI、解析、重试
 ├── generate_rules.md      # 给 AI 的规则
 ├── validate.py            # 三项齐全、禁代码化描述
+├── submit.py / locking.py # 按天提交、待核实记录与报告锁
+├── amend.py               # 按各工单 ID 独立重排已填百分比
 ├── sources/{eom,gitlab}.py
 ├── render/memo.py         # 三段式拼接与整周导出
 └── web/{server,session}.py + page.html
@@ -119,9 +156,9 @@ src/git_daily_report/
 
 ### EOM 接口
 
-取自 EOM 前端「日程表」页面，所有业务请求都走 `POST {EOM_BASE_URL}/core/busi/exec`，请求头带 `token`、`application: platform`、`tenant: default`，靠 `condition.op` 区分操作。这里只用 `op: "schedule"`（按年月取每天的工单与已填进展）。
+取自 EOM 前端「日程表」页面，所有业务请求都走 `POST {EOM_BASE_URL}/core/busi/exec`，请求头带 `token`、`application: platform`、`tenant: default`，靠 `condition.op` 区分操作。`schedule` 按年月读取排期，`commitReport` 提交日报。
 
-**只读**：工具不调用 `commitReport`，没有任何写回 EOM 的通道。
+提交按日期组织 `rows`，`rate` 映射为 `ewdRate`，`hours` 映射为 `ewdWorkRealTimes`；新填 `op=4`，修正已填日报 `op=8` 并带日报 `id`。其他元数据从最新排期读取，不交给 AI 生成。写请求只发送一次，成功响应后还需回读逐项核对。`output/.eom-submit.json` 共享待核实记录，目录级提交锁防止周报与自定义区间重复提交，报告锁保护编辑与生成；均不含凭据。
 
 ### 合并提交要展开，不能丢
 
@@ -138,7 +175,7 @@ src/git_daily_report/
 
 ## 边界
 
-- 不写 EOM。页面是给人复制粘贴的，工具本身没有任何写回通道
+- 只有显式提交操作会写 EOM；只有 `dr amend` 或网页标为「待修正」的条目会覆盖已有日报，且只改百分比
 - 服务只绑 `127.0.0.1`，不做部署、不对外暴露
 - AI 只拆分、细化、改写提交里已有的工作，不编造功能与数字
 
