@@ -34,8 +34,12 @@
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   button.primary:hover:not(:disabled) { color: #fff; opacity: .9; }
   button.small { font-size: 12px; padding: 1px 8px; }
-  input[type=date] { border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px;
+  input[type=date], input[type=number] { border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px;
                      background: var(--card); color: var(--ink); }
+  .numbers { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+  .numbers input { width: 90px; }
+  .day-total { font-size: 13px; font-weight: normal; color: var(--muted); margin-left: 8px; }
+  .submit-results { white-space: pre-wrap; }
   .status { color: var(--muted); font-size: 13px; white-space: pre-wrap; }
   .grow { flex: 1; }
   main { flex: 1; width: 100%; max-width: 920px; margin: 0 auto; padding: 8px 16px 24px; }
@@ -88,6 +92,8 @@
 <main id="main"></main>
 
 <footer>
+  <button class="primary" id="submit">一键提交当前区间</button>
+  <button id="retry-unknown" title="核实后再次发送仍未确认的工单">已核实未提交，重试</button>
   <span class="grow"></span>
   <button id="copy-all">复制全文</button>
   <button id="download">下载 .md</button>
@@ -95,12 +101,17 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const state = { days: [], gaps: [], busy: false };
+const state = { days: [], gaps: [], submitGaps: [], busy: false, edits: new Map(), submitResults: [] };
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
 
 async function api(path, options) {
   const res = await fetch(path, options);
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) {
+    const text = await res.text();
+    let message = text;
+    try { message = JSON.parse(text).error ?? text; } catch { /* 非 JSON 错误保留原文 */ }
+    throw new Error(message);
+  }
   return res.json();
 }
 
@@ -117,11 +128,13 @@ function field(label, text) {
     + `<button class="small" data-copy="${esc(text)}">复制</button></div>`;
 }
 
-function renderOrder(order) {
+function renderOrder(order, day) {
   const p = order.progress;
   const sub = [order.projectName, order.taskTitle].filter(Boolean).join(' · ');
   const tags = [];
+  if (p && p.source === 'ai') tags.push('<span class="tag">数值为估算，可调整</span>');
   if (p && p.source === 'eom') tags.push('<span class="tag filled">EOM 已填</span>');
+  if (p && p.source === 'amend') tags.push(`<span class="tag">待修正，原 ${esc(p.originalRate ?? '缺失')}%</span>`);
   if (p && p.problems.length) tags.push('<span class="tag warn">需复核</span>');
   const head = `<div class="title"><b>${esc(order.title)}</b>${tags.join('')}`
     + `<span class="sub">${esc(sub)}</span></div>`;
@@ -132,25 +145,52 @@ function renderOrder(order) {
   const problems = p.problems.length ? `<div class="problems">${esc(p.problems.join('；'))}</div>` : '';
   return `<div class="card${p.problems.length ? ' flagged' : ''}">${head}`
     + field('今日进展', p.memo) + field('存在问题', p.issue) + field('明日计划', p.plan)
-    + problems + '</div>';
+    + numericFields(order, day) + problems + '</div>';
+}
+
+function numericFields(order, day) {
+  const p = order.progress;
+  if (p.source !== 'ai' && p.source !== 'amend') {
+    return `<div class="numbers">工单进展：${esc(p.rate ?? '缺失')}% · 工时：${esc(p.hours ?? '缺失')}h</div>`;
+  }
+  const edit = state.edits.get(`${day}:${order.id}`);
+  const values = edit ?? { rate: p.rate ?? '', hours: p.hours ?? '' };
+  return `<div class="numbers" data-day="${esc(day)}" data-order="${esc(order.id)}">`
+    + `<label>工单进展 <input aria-label="工单进展百分比" name="rate" type="number" min="0" max="100" step="any" required value="${esc(values.rate)}">%</label>`
+    + `<label>工时 <input aria-label="工单工时" name="hours" type="number" min="0" max="7.5" step="any" required${p.source === 'amend' ? ' readonly' : ''} value="${esc(values.hours)}">h</label>`
+    + `<button class="small" data-save>保存数值${edit ? '（未保存）' : ''}</button></div>`;
 }
 
 function render() {
-  const box = $('main');
+  let content = '';
   if (state.gaps.length) {
-    box.innerHTML = `<div class="gaps"><b>缺少配置，无法生成</b><ul>${
+    content += `<div class="gaps"><b>生成所需配置尚未补齐，仍可查看本地报告</b><ul>${
       state.gaps.map((g) => `<li><code>${esc(g)}</code></li>`).join('')
     }</ul><p>在项目根目录的 <code>.env</code> 里补齐后重启即可。</p></div>`;
-    return;
+  }
+  if (state.submitGaps.length) {
+    content += `<div class="gaps">提交所需配置：${esc(state.submitGaps.join('；'))}</div>`;
+  }
+  if (state.submitResults.length) {
+    const labels = { submitted: '已提交', skipped: '已有日报，跳过', blocked: '校验阻止', failed: '提交失败', conflict: '内容冲突', unknown: '结果待核实', ready: '预检通过' };
+    content += `<div class="panel submit-results">${state.submitResults.map((result) =>
+      `${esc(result.day)}：${esc(labels[result.status] ?? result.status)}${result.message ? '；' + esc(result.message) : ''}`
+    ).join('\n')}</div>`;
   }
   if (!state.days.length) {
-    box.innerHTML = '<div class="empty">这个区间还没有内容，点「拉取并生成」开始。</div>';
-    return;
+    content += '<div class="empty">这个区间还没有内容，运行技能生成或点「拉取并生成」开始。</div>';
+  } else {
+    content += state.days.map((day) => {
+      const week = WEEKDAYS[new Date(`${day.day}T00:00:00`).getDay()];
+      const known = day.orders.filter((o) => Number.isFinite(o.progress?.hours));
+      const total = known.reduce((sum, o) => sum + o.progress.hours, 0);
+      const pending = known.length !== day.orders.length ? '，工时待补齐' : '';
+      return `<h2>${day.day} 周${week}<span class="day-total">已保存工时 ${Number(total.toFixed(4))} / 7.5h${pending}</span></h2>`
+        + day.orders.map((order) => renderOrder(order, day.day)).join('');
+    }).join('');
   }
-  box.innerHTML = state.days.map((day) => {
-    const week = WEEKDAYS[new Date(`${day.day}T00:00:00`).getDay()];
-    return `<h2>${day.day} 周${week}</h2>${day.orders.map(renderOrder).join('')}`;
-  }).join('');
+  $('main').innerHTML = content;
+  updateControls();
 }
 
 async function load() {
@@ -159,20 +199,26 @@ async function load() {
   $('until').value = data.range.until;
   state.days = data.days;
   state.gaps = data.gaps;
+  state.submitGaps = data.submitGaps;
   render();
 }
 
 async function setPeriod(payload) {
+  if (state.busy) return;
+  if (state.edits.size) { status('请先保存数值修改，再切换日期。'); return; }
+  setBusy(true);
   try {
     await api('/api/period', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
+    state.submitResults = [];
     status('');
   } catch (err) {
-    status(`出错：${JSON.parse(err.message).error ?? err.message}`);
+    status(`出错：${err.message}`);
+  } finally {
+    try { await load(); } finally { setBusy(false); }
   }
-  await load();
 }
 
 async function stream(path, body, onEvent) {
@@ -180,6 +226,10 @@ async function stream(path, body, onEvent) {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
+  if (!res.ok) {
+    const message = await res.json();
+    throw new Error(message.error ?? '生成请求失败');
+  }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -229,11 +279,20 @@ function renderRun() {
 
 function setBusy(busy) {
   state.busy = busy;
-  document.querySelectorAll('header button, header input').forEach((el) => { el.disabled = busy; });
+  document.querySelectorAll('button, input').forEach((el) => { el.disabled = busy; });
+  updateControls();
+}
+
+function updateControls() {
+  $('pull').disabled = state.busy || Boolean(state.gaps.length) || Boolean(state.edits.size);
+  const cannotSubmit = state.busy || Boolean(state.submitGaps.length) || !state.days.length || Boolean(state.edits.size);
+  $('submit').disabled = cannotSubmit;
+  $('retry-unknown').disabled = cannotSubmit;
 }
 
 $('pull').onclick = async () => {
-  if (state.busy) return;
+  if (state.busy || state.edits.size) return;
+  state.submitResults = [];
   setBusy(true);
   Object.assign(run, { steps: [], error: '', started: Date.now() });
   status('');
@@ -265,13 +324,70 @@ document.querySelectorAll('[data-range]').forEach((btn) => {
   $(id).onchange = () => setPeriod({ since: $('since').value, until: $('until').value });
 });
 
-$('main').addEventListener('click', async (e) => {
-  const btn = e.target.closest('[data-copy]');
-  if (!btn) return;
-  await navigator.clipboard.writeText(btn.dataset.copy);
-  btn.textContent = '已复制';
-  setTimeout(() => { btn.textContent = '复制'; }, 1200);
+$('main').addEventListener('input', (e) => {
+  const row = e.target.closest('.numbers[data-day]');
+  if (!row) return;
+  state.edits.set(`${row.dataset.day}:${row.dataset.order}`, {
+    rate: row.querySelector('[name=rate]').value,
+    hours: row.querySelector('[name=hours]').value,
+  });
+  row.querySelector('[data-save]').textContent = '保存数值（未保存）';
+  status('数值已修改，请保存后提交。');
+  updateControls();
 });
+
+$('main').addEventListener('click', async (e) => {
+  if (state.busy) return;
+  const save = e.target.closest('[data-save]');
+  if (save) {
+    const row = save.closest('.numbers');
+    const inputs = [...row.querySelectorAll('input')];
+    if (!inputs.every((input) => input.reportValidity())) return;
+    const key = `${row.dataset.day}:${row.dataset.order}`;
+    setBusy(true);
+    try {
+      await api('/api/progress', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ day: row.dataset.day, orderId: row.dataset.order,
+          rate: Number(inputs[0].value), hours: Number(inputs[1].value) }),
+      });
+      state.edits.delete(key);
+      state.submitResults = [];
+      await load();
+      status(state.edits.size ? '数值已保存；其他修改仍需保存。' : '数值已保存，并重新校验。');
+    } catch (err) { status(`保存失败：${err.message}`); }
+    finally { setBusy(false); }
+    return;
+  }
+  const copy = e.target.closest('[data-copy]');
+  if (!copy) return;
+  try {
+    await navigator.clipboard.writeText(copy.dataset.copy);
+    copy.textContent = '已复制';
+    setTimeout(() => { copy.textContent = '复制'; }, 1200);
+  } catch (err) { status(`复制失败：${err.message}`); }
+});
+
+async function submit(retryUnknown = false) {
+  if (state.busy || state.edits.size) return;
+  if (retryUnknown && !confirm('请先在 EOM 核实尚未提交。此操作会再次发送仍未确认的工单，是否重试？')) return;
+  setBusy(true);
+  status('正在核对排期并提交，请稍候。');
+  try {
+    const result = await api('/api/submit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ since: $('since').value, until: $('until').value, retryUnknown }),
+    });
+    state.submitResults = result.days;
+    await load();
+    status('提交处理完成，逐日结果见上方。');
+  } catch (err) {
+    status(`提交中断：${err.message}。请先核对 EOM 中的实际结果，再重试。`);
+  } finally { setBusy(false); }
+}
+
+$('submit').onclick = () => submit();
+$('retry-unknown').onclick = () => submit(true);
 
 $('copy-all').onclick = async () => {
   const res = await fetch('/api/export');
@@ -283,7 +399,7 @@ $('download').onclick = () => {
   window.location = '/api/export?download=1';
 };
 
-load();
+load().catch((err) => status(`加载失败：${err.message}`));
 </script>
 </body>
 </html>

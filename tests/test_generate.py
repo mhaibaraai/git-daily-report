@@ -25,6 +25,8 @@ def item(day: str, order_id: str, **overrides) -> dict:
         "problem": [],
         "issue": "",
         "plan": "完成筛选结果联调",
+        "rate": 50,
+        "hours": 3,
     }
     return {**base, **overrides}
 
@@ -77,7 +79,7 @@ def test_every_pending_block_gets_a_three_section_memo():
 
 
 def test_filled_blocks_are_neither_sent_nor_overwritten():
-    filled = Progress(memo="具体任务：已填", issue="无", plan="联调", source="eom")
+    filled = Progress(memo="具体任务：已填", issue="无", plan="联调", source="eom", rate=40, hours=3)
     days = [ScheduleDay("2026-10-26", (order("1", progress=filled), order("2", "报表数据梳理")))]
     ai = FakeAi({"items": [item("2026-10-26", "2")]})
     result = generate(days, [], ai)
@@ -189,7 +191,7 @@ def test_apply_blocks_fills_pending_and_reports_failures():
 
 
 def test_apply_blocks_only_overwrites_given_keys_and_never_eom():
-    eom = Progress(memo="具体任务：已填", issue="无", plan="联调", source="eom")
+    eom = Progress(memo="具体任务：已填", issue="无", plan="联调", source="eom", rate=40, hours=1.5)
     days = [ScheduleDay("2026-10-26", (order("1"), order("2"), order("3", progress=eom)))]
     first, _ = apply_blocks(days, parse_items(json.dumps({"items": [
         item("2026-10-26", "1"), item("2026-10-26", "2", plan=""),
@@ -203,3 +205,46 @@ def test_apply_blocks_only_overwrites_given_keys_and_never_eom():
     assert result[0].orders[0].progress == first[0].orders[0].progress
     assert result[0].orders[1].progress.plan == "完成验收"
     assert result[0].orders[2].progress is eom
+
+
+def test_daily_overflow_is_retried_with_preserved_context():
+    filled = Progress("具体任务：已填", "无", "核对", "eom", rate=10, hours=4.5)
+    days = [ScheduleDay("2026-10-26", (order("1", progress=filled), order("2")))]
+    ai = FakeAi({"items": [item("2026-10-26", "2", hours=4)]},
+                {"items": [item("2026-10-26", "2", hours=3)]})
+    result = generate(days, [], ai)
+    assert len(ai.calls) == 2
+    retry = json.loads(ai.calls[1][-1]["content"])
+    assert retry["schedule"][0]["orders"][0]["hours"] == 4.5
+    assert "7.5" in retry["只重写这些"][0]["上次的问题"][0]
+    assert result[0].orders[1].progress.hours == 3
+    assert result[0].orders[1].progress.problems == ()
+
+
+def test_partial_apply_revalidates_old_blocks_when_daily_total_changes():
+    days = [ScheduleDay("2026-10-26", (order("1"), order("2")))]
+    first, _ = apply_blocks(days, {("2026-10-26", "1"): item("2026-10-26", "1", hours=4.5)})
+    result, failures = apply_blocks(first, {("2026-10-26", "2"): item("2026-10-26", "2", hours=4)})
+    assert len(failures) == 2
+    assert all(any("7.5" in p for p in o.progress.problems) for o in result[0].orders)
+
+
+def test_multiline_task_cannot_hide_code_terms_after_memo_conversion():
+    days = [ScheduleDay("2026-10-26", (order("1"),))]
+    result, failures = apply_blocks(days, {
+        ("2026-10-26", "1"): item("2026-10-26", "1", task=["完成核对\ngetUserInfo"]),
+    })
+    assert any("getUserInfo" in p for p in failures[("2026-10-26", "1")])
+    assert result[0].orders[0].progress.problems
+
+
+def test_material_preserves_previous_allocation_context_without_changing_order_id():
+    from dataclasses import replace
+    linked = replace(order("new-id"), rate_min=70, previous_day="2026-10-20",
+                     previous_memo="具体任务：完成首轮验证\n关键数据：无\n问题解决过程：无")
+    entry = build_material([ScheduleDay("2026-10-21", (linked,))], [])["schedule"][0]["orders"][0]
+    assert entry["id"] == "new-id"
+    assert entry["rateMin"] == 70
+    assert entry["previousDay"] == "2026-10-20"
+    assert "完成首轮验证" in entry["previousMemo"]
+    assert Order.from_dict(linked.to_dict()) == linked

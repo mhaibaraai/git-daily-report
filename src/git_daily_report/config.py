@@ -52,21 +52,21 @@ class Config:
     eom: EomConfig
     ai: AiConfig
 
-    def missing(self, need_ai: bool = True) -> list[str]:
+    def missing(self, need_ai: bool = True, need_gitlab: bool = True) -> list[str]:
         """列出缺哪些凭证，顺带说明去哪里拿；由 Claude 生成时不需要 AI 接口。"""
         gaps: list[str] = []
         if not self.eom.base_url:
             gaps.append("EOM_BASE_URL（EOM 后端接口地址，见 README）")
         if not self.eom.token:
             gaps.append("EOM_TOKEN（企微内打开 EOM，开启 webView 元素审查后复制请求头 token，见 README）")
-        if not self.gitlab.base_url or not self.gitlab.token:
+        if need_gitlab and (not self.gitlab.base_url or not self.gitlab.token):
             gaps.append("GITLAB_BASE_URL / GITLAB_TOKEN（GitLab personal access token，勾 read_api）")
         if need_ai and not self.ai.api_key:
             gaps.append("AI_API_KEY（任意 OpenAI 兼容接口，配 AI_BASE_URL 与 AI_MODEL）")
         return gaps
 
-    def require(self, need_ai: bool = True) -> None:
-        gaps = self.missing(need_ai)
+    def require(self, need_ai: bool = True, need_gitlab: bool = True) -> None:
+        gaps = self.missing(need_ai, need_gitlab)
         if gaps:
             raise ConfigError(
                 "缺少必要配置：\n  - " + "\n  - ".join(gaps) + f"\n请在 {ENV_PATH} 中补齐。"

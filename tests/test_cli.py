@@ -122,7 +122,7 @@ def test_apply_validates_fills_and_saves(workspace, tmp_path, capsys):
     capsys.readouterr()
     items = tmp_path / "items.json"
     block = {"day": "2026-10-26", "orderId": "1", "task": ["完成订单筛选"], "data": [],
-             "problem": [], "issue": "", "plan": ""}
+             "problem": [], "issue": "", "plan": "", "rate": 50, "hours": 7.5}
     items.write_text(json.dumps({"items": [block]}, ensure_ascii=False), encoding="utf-8")
 
     assert cli.main(["apply", str(items), *WEEK]) == 0
@@ -154,3 +154,25 @@ def test_apply_reports_unreadable_items_file(workspace, tmp_path, capsys):
 
     assert cli.main(["apply", str(tmp_path / "nope.json"), *WEEK]) == 1
     assert "nope.json" in capsys.readouterr().err
+
+
+def test_submit_requires_only_eom_and_passes_preview_and_retry_options(monkeypatch, tmp_path, capsys):
+    cfg = Config(GitlabConfig("", ""), EomConfig("http://e", "T"), AiConfig("", "", "m"))
+    calls = []
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(cli, "submit_report", lambda *args, **kwargs: calls.append((args, kwargs)) or
+                        {"days": [{"day": "2026-10-26", "status": "ready"}]}, raising=False)
+    assert cli.main(["submit", *WEEK, "--dry-run", "--retry-unknown"]) == 0
+    assert json.loads(capsys.readouterr().out)["days"][0]["status"] == "ready"
+    assert calls[0][0][0] == cfg.eom
+    assert calls[0][1] == {"dry_run": True, "retry_unknown": True}
+
+
+def test_submit_blocked_is_nonzero_for_automation(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "load_config", lambda: FULL_CFG)
+    monkeypatch.setattr(cli, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(cli, "submit_report", lambda *args, **kwargs:
+                        {"days": [{"day": "2026-10-26", "status": "blocked"}]}, raising=False)
+    assert cli.main(["submit", *WEEK]) == 1
+    assert json.loads(capsys.readouterr().out)["days"][0]["status"] == "blocked"

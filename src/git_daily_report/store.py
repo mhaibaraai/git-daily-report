@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import os
+from tempfile import NamedTemporaryFile
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Sequence
@@ -45,4 +47,14 @@ def save_days(path: Path, since: date, until: date, days: Sequence[ScheduleDay])
         "range": {"since": since.isoformat(), "until": until.isoformat()},
         "days": [d.to_dict() for d in days],
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary = None
+    try:
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)

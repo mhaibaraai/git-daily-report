@@ -62,38 +62,89 @@ def _make_handler(cfg: Config, session: ReportSession, lock: threading.Lock):
             pass
 
         def do_GET(self):
+            if not self._local_host():
+                return self._json(403, {"error": "仅允许本机访问"})
             path, query = _split(self.path)
             if path == "/":
                 return self._send(200, "text/html; charset=utf-8", PAGE.read_bytes())
             if path == "/api/state":
-                return self._json(200, _state(cfg, session))
+                with lock:
+                    return self._json(200, _state(cfg, session))
             if path == "/api/export":
                 return self._export(query)
             self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            if not self._local_host() or self.headers.get("Origin") != f"http://{self.headers.get('Host')}":
+                self.close_connection = True
+                return self._json(403, {"error": "仅允许本机同源请求"})
+            if self.headers.get_content_type() != "application/json":
+                self.close_connection = True
+                return self._json(415, {"error": "请求必须使用 application/json"})
+            try:
+                body = self._read_json()
+            except ValueError as exc:
+                self.close_connection = True
+                return self._json(400, {"error": str(exc)})
             path, _ = _split(self.path)
-            body = self._read_json()
             if path == "/api/period":
                 return self._period(body)
             if path == "/api/sync":
                 return self._stream(lambda: _sync_events(cfg, session, body))
+            if path == "/api/progress":
+                return self._progress(body)
+            if path == "/api/submit":
+                return self._submit(body)
             self._json(404, {"error": "not found"})
+
+        def _local_host(self) -> bool:
+            return self.headers.get("Host") in {
+                f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}",
+            }
+
+        def _progress(self, body: dict):
+            try:
+                day = body.get("day")
+                order_id = body.get("orderId")
+                if not isinstance(day, str) or len(day) != 10 or date.fromisoformat(day).isoformat() != day:
+                    raise ValueError("日期格式必须是 YYYY-MM-DD")
+                if not isinstance(order_id, str) or not order_id or len(order_id) > 100:
+                    raise ValueError("工单 ID 格式不正确")
+                with lock:
+                    session.update_progress(day, order_id, body.get("rate"), body.get("hours"))
+                    state = _state(cfg, session)
+            except (ValueError, ConfigError) as exc:
+                return self._json(400, {"error": str(exc)})
+            self._json(200, state)
+
+        def _submit(self, body: dict):
+            try:
+                retry = body.get("retryUnknown", False)
+                if not isinstance(retry, bool):
+                    raise ValueError("retryUnknown 必须是布尔值")
+                with lock:
+                    if "since" in body or "until" in body:
+                        session.set_period(*_period_from(body))
+                    result = session.submit(cfg, retry_unknown=retry)
+            except (ValueError, ConfigError, SourceError) as exc:
+                return self._json(400, {"error": str(exc)})
+            self._json(200, result)
 
         def _period(self, body: dict):
             try:
                 with lock:
                     session.set_period(*_period_from(body))
+                    state = _state(cfg, session)
             except ValueError as exc:
                 return self._json(400, {"error": str(exc)})
-            self._json(200, _state(cfg, session))
+            self._json(200, state)
 
         def _export(self, query: dict):
             with lock:
                 text = session.text()
+                name = f"{session.since}_{session.until}.md"
             headers = {}
             if query.get("download"):
-                name = f"{session.since}_{session.until}.md"
                 headers["Content-Disposition"] = f'attachment; filename="{name}"'
             self._send(200, "text/plain; charset=utf-8", text.encode("utf-8"), headers)
 
@@ -116,13 +167,16 @@ def _make_handler(cfg: Config, session: ReportSession, lock: threading.Lock):
                         return
 
         def _read_json(self) -> dict:
-            length = int(self.headers.get("Content-Length") or 0)
-            if not length:
-                return {}
             try:
-                return json.loads(self.rfile.read(length) or b"{}")
-            except json.JSONDecodeError:
-                return {}
+                length = int(self.headers.get("Content-Length") or 0)
+                if not 0 <= length <= 65536 or self.headers.get("Transfer-Encoding"):
+                    raise ValueError("请求内容过大或格式不正确")
+                body = json.loads(self.rfile.read(length) or b"{}", parse_constant=_bad_constant)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise ValueError("请求内容不是有效 JSON") from exc
+            if not isinstance(body, dict):
+                raise ValueError("请求内容必须是 JSON 对象")
+            return body
 
         def _json(self, status: int, payload: Any):
             self._send(
@@ -144,10 +198,16 @@ def _make_handler(cfg: Config, session: ReportSession, lock: threading.Lock):
 
 
 def _state(cfg: Config, session: ReportSession) -> dict:
-    return {**session.state(), "gaps": cfg.missing()}
+    return {
+        **session.state(), "gaps": cfg.missing(),
+        "submitGaps": cfg.missing(need_ai=False, need_gitlab=False),
+    }
 
 
 def _period_from(body: dict) -> tuple[date, date]:
+    for field in ("since", "until", "shortcut"):
+        if field in body and (not isinstance(body[field], str) or len(body[field]) > 32):
+            raise ValueError("日期参数格式不正确")
     if body.get("shortcut"):
         return shortcut(body["shortcut"])
     return resolve(since=body.get("since"), until=body.get("until"))
@@ -205,3 +265,7 @@ def _split(raw: str) -> tuple[str, dict]:
         if key:
             parsed[key] = value
     return path, parsed
+
+
+def _bad_constant(_value: str):
+    raise ValueError("请求不允许 NaN 或无穷大")

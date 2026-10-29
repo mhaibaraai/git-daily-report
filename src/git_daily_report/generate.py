@@ -17,7 +17,7 @@ from .config import AiConfig
 from .models import Commit, Order, Progress, ScheduleDay
 from .render.memo import EMPTY, build_memo
 from .text import clean_entry, headline, is_merge_commit, strip_commit_prefix
-from .validate import check_block, fill_empty
+from .validate import check_block, fill_empty, validate_days
 
 # 流式回调：kind 为 thinking（推理过程）或 content（正文），text 为至今累计的内容
 OnChunk = Callable[[str, str], None]
@@ -109,17 +109,16 @@ def generate(
     material = build_material(days, commits)
     report(f"AI 生成：等待响应，共 {len(pending)} 块")
     blocks = _ask(complete, _user_message(material), _tracker(report, "AI 生成", len(pending)))
-    failures = _failures(pending, blocks)
+    filled, failures = apply_blocks(days, blocks)
     if failures:
         report(f"校验：{len(failures)} 块不合格，交给 AI 重写")
         retry = _ask(
-            complete, _user_message(material, failures), _tracker(report, "AI 重写", len(failures))
+            complete, _user_message(build_material(filled, commits), failures),
+            _tracker(report, "AI 重写", len(failures))
         )
-        blocks = {**blocks, **{k: v for k, v in retry.items() if k in failures}}
-        failures = _failures(pending, blocks)
+        filled, failures = apply_blocks(filled, {k: v for k, v in retry.items() if k in failures})
     report(f"校验：{len(failures)} 块仍需复核" if failures else "校验：全部通过")
 
-    filled, _ = apply_blocks(days, blocks)
     return [replace(day, orders=tuple(_or_missing(o) for o in day.orders)) for day in filled]
 
 
@@ -146,9 +145,9 @@ def apply_blocks(
     只覆盖 blocks 里给出的块，便于只重写不合格的几块再合并；EOM 已填的块永不覆盖。
     还没有内容的块记为「没有生成」。
     """
-    filled = [
+    filled = validate_days([
         replace(day, orders=tuple(_fill(day.day, o, blocks) for o in day.orders)) for day in days
-    ]
+    ])
     failures: dict[Key, list[str]] = {}
     for day in filled:
         for order in day.orders:
@@ -165,9 +164,16 @@ def _order_material(order: Order) -> dict[str, Any]:
         "工单标题": order.title,
         "任务标题": order.task_title,
         "项目名称": order.project_name,
+        "rateMin": order.rate_min,
+        "rateMax": order.rate_max,
+        "previousDay": order.previous_day,
+        "previousMemo": order.previous_memo,
     }
     if order.progress is not None:
-        entry["已填写"] = order.progress.memo
+        p = order.progress
+        entry["已填写" if p.source in {"eom", "amend"} else "已生成"] = p.memo
+        entry["rate"] = p.rate
+        entry["hours"] = p.hours
     return entry
 
 
@@ -213,15 +219,6 @@ def _ask(complete: Complete, user: str, on_chunk: OnChunk) -> dict[Key, dict[str
     return parse_items(complete(messages, on_chunk))
 
 
-def _failures(pending: set[Key], blocks: Mapping[Key, dict[str, Any]]) -> dict[Key, list[str]]:
-    failures: dict[Key, list[str]] = {}
-    for key in pending:
-        problems = check_block(blocks[key]) if key in blocks else [MISSING]
-        if problems:
-            failures[key] = problems
-    return failures
-
-
 def _fill(day: str, order: Order, blocks: Mapping[Key, dict[str, Any]]) -> Order:
     block = blocks.get((day, order.id))
     if block is None or (order.progress is not None and order.progress.source != "ai"):
@@ -232,6 +229,8 @@ def _fill(day: str, order: Order, blocks: Mapping[Key, dict[str, Any]]) -> Order
         plan=str(block.get("plan") or "").strip(),
         source="ai",
         problems=tuple(check_block(block)),
+        rate=block.get("rate"),
+        hours=block.get("hours"),
     )
     return replace(order, progress=progress)
 
@@ -245,4 +244,4 @@ def _or_missing(order: Order) -> Order:
 def _strings(value: Any) -> list[str]:
     if isinstance(value, str):
         return [value]
-    return [str(v) for v in value or () if isinstance(v, (str, int, float))]
+    return [str(v) for v in value if isinstance(v, (str, int, float))] if isinstance(value, list) else []
