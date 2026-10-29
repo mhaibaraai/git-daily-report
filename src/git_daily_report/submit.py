@@ -266,7 +266,7 @@ def _verify(rows: list[dict], raw_orders: list[dict]) -> str:
         if not isinstance(report, dict) or not report.get("id"):
             complete = False
             continue
-        if report.get("ewdDate") != row["ewdDate"]:
+        if report.get("ewdDate") not in {row["ewdDate"], f"{row['ewdDate']} 00:00:00"}:
             return "conflict"
         try:
             if _identifier(report.get("ewlOrderId")) != row["ewlOrderId"]:

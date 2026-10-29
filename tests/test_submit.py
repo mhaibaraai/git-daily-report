@@ -18,6 +18,15 @@ SINCE = date(2026, 10, 19)
 UNTIL = date(2026, 10, 20)
 
 
+@responses.activate
+def test_submit_confirms_report_date_returned_with_midnight(tmp_path):
+    path = archive(tmp_path)
+    schedule()
+    responses.add(responses.POST, URL, json={"code": 200})
+    schedule([raw_order(report={**report(), "ewdDate": "2026-10-19 00:00:00"})])
+    assert run(path)["days"][0]["status"] == "submitted"
+
+
 def raw_order(order_id="1", report=None):
     return {
         "id": order_id, "ewlTitle": "订单核验", "ewlWorkPlanTimes": 52.5,
