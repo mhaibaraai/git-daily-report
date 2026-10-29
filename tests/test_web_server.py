@@ -10,6 +10,7 @@ import threading
 from datetime import date
 from http.server import ThreadingHTTPServer
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 import pytest
 
@@ -59,7 +60,7 @@ class Client:
         request = Request(
             f"{self._base}{path}",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Origin": self._base},
         )
         with urlopen(request) as res:
             return res.status, res.read().decode("utf-8")
@@ -195,3 +196,215 @@ def test_chat_route_is_gone(client):
         api.post("/api/chat", {"message": "hi"})
 
     assert "404" in str(excinfo.value)
+
+
+def raw_post(api, body=b"{}", **headers):
+    request = Request(
+        api._base + "/api/progress", data=body,
+        headers={"Content-Type": "application/json", "Origin": api._base, **headers},
+    )
+    try:
+        with urlopen(request) as res:
+            return res.status, res.read().decode()
+    except HTTPError as exc:
+        return exc.code, exc.read().decode()
+
+
+@pytest.mark.parametrize("headers", [
+    {"Origin": "https://other.test"}, {"Origin": "null"},
+    {"Content-Type": "text/plain"}, {"Host": "other.test"},
+    {"Origin": "http://localhost:1"},
+])
+def test_write_routes_reject_cross_origin_and_non_json(client, headers):
+    api, _ = client
+    status, _ = raw_post(api, **headers)
+    assert status in (403, 415)
+
+
+@pytest.mark.parametrize("body", [b"[]", b"null", b"{", b"true"])
+def test_write_routes_require_a_json_object(client, body):
+    api, _ = client
+    status, _ = raw_post(api, body)
+    assert status == 400
+
+
+def test_progress_update_persists_numbers_and_rechecks_entire_day(client):
+    api, session = client
+    status, body = api.post("/api/progress", {
+        "day": "2026-10-26", "orderId": "1", "rate": 70, "hours": 7.5,
+    })
+    assert status == 200
+    result = json.loads(body)
+    assert result["days"][0]["orders"][0]["progress"]["hours"] == 7.5
+    assert session.days[0].orders[0].progress.rate == 70
+    assert store.load_days(session.path)[0].orders[0].progress.hours == 7.5
+
+
+@pytest.mark.parametrize("overrides", [
+    {"rate": True}, {"hours": "7.5"}, {"hours": float("nan")},
+    {"rate": -1}, {"rate": 101}, {"hours": -1},
+    {"day": []}, {"orderId": []},
+])
+def test_progress_update_rejects_invalid_fields(client, overrides):
+    api, _ = client
+    payload = {"day": "2026-10-26", "orderId": "1", "rate": 70, "hours": 7.5, **overrides}
+    with pytest.raises(HTTPError) as exc:
+        api.post("/api/progress", payload)
+    assert exc.value.code == 400
+
+
+def test_progress_update_never_edits_eom_reports(client):
+    from dataclasses import replace
+    api, session = client
+    d = session.days[0]
+    order = d.orders[0]
+    session.days = [replace(d, orders=(replace(order, progress=replace(order.progress, source="eom")),))]
+    store.save_days(session.path, SINCE, UNTIL, session.days)
+    with pytest.raises(HTTPError) as exc:
+        api.post("/api/progress", {"day": d.day, "orderId": order.id, "rate": 70, "hours": 7.5})
+    assert exc.value.code == 400
+
+
+def test_progress_update_turns_filled_report_rate_into_amend_and_back(client):
+    from dataclasses import replace
+    api, session = client
+    d = session.days[0]
+    order = d.orders[0]
+    filled = replace(order.progress, source="eom", rate=60, hours=3, problems=(), report_id="900")
+    store.save_days(session.path, SINCE, UNTIL, [replace(d, orders=(replace(order, progress=filled),))])
+    api.post("/api/progress", {"day": d.day, "orderId": order.id, "rate": 40, "hours": 3})
+    p = store.load_days(session.path)[0].orders[0].progress
+    assert (p.source, p.rate, p.original_rate) == ("amend", 40, 60)
+    with pytest.raises(HTTPError):
+        api.post("/api/progress", {"day": d.day, "orderId": order.id, "rate": 40, "hours": 4})
+    api.post("/api/progress", {"day": d.day, "orderId": order.id, "rate": 60, "hours": 3})
+    p = store.load_days(session.path)[0].orders[0].progress
+    assert (p.source, p.rate, p.original_rate) == ("eom", 60, None)
+
+
+def test_submit_uses_only_eom_config_and_reloads_report(client, monkeypatch):
+    api, session = client
+    calls = []
+    def fake_submit(self, cfg, *, retry_unknown=False):
+        calls.append((cfg, retry_unknown))
+        return {"days": [{"day": "2026-10-26", "status": "submitted"}]}
+    monkeypatch.setattr(ReportSession, "submit", fake_submit, raising=False)
+    status, body = api.post("/api/submit", {"since": SINCE.isoformat(), "until": UNTIL.isoformat()})
+    assert status == 200
+    assert json.loads(body)["days"][0]["status"] == "submitted"
+    assert calls == [(FULL, False)]
+
+
+@pytest.mark.parametrize("client", [Config(
+    gitlab=GitlabConfig("", ""), eom=FULL.eom,
+    ai=AiConfig("", "", "m"),
+)], indirect=True)
+def test_local_view_and_submit_do_not_require_ai_or_gitlab(client, monkeypatch):
+    api, _ = client
+    state = json.loads(api.get("/api/state")[1])
+    assert state["days"]
+    assert state["submitGaps"] == []
+    assert any("AI_API_KEY" in gap for gap in state["gaps"])
+    monkeypatch.setattr(ReportSession, "submit", lambda *args, **kwargs: {"days": []}, raising=False)
+    assert api.post("/api/submit", {})[0] == 200
+
+
+def test_submit_rejects_bad_retry_option(client):
+    api, _ = client
+    with pytest.raises(HTTPError) as exc:
+        api.post("/api/submit", {"retryUnknown": "true"})
+    assert exc.value.code == 400
+
+
+def test_page_contains_numeric_editing_and_submit_controls(client):
+    api, _ = client
+    body = api.get("/")[1]
+    assert 'id="submit"' in body
+    assert '/api/progress' in body
+    assert '估算' in body
+    assert '7.5' in body
+
+
+def test_numeric_save_marks_all_local_blocks_when_daily_sum_exceeds_limit(client):
+    from dataclasses import replace
+    api, session = client
+    day = session.days[0]
+    base = day.orders[0]
+    first = replace(base, progress=replace(base.progress, rate=70, hours=4))
+    second = replace(base, id="2", progress=replace(base.progress, source="eom", rate=50, hours=4))
+    store.save_days(session.path, SINCE, UNTIL, [replace(day, orders=(first, second))])
+    body = json.loads(api.post("/api/progress", {
+        "day": day.day, "orderId": "1", "rate": 70, "hours": 4,
+    })[1])
+    result = body["days"][0]["orders"]
+    assert any("7.5" in problem for problem in result[0]["progress"]["problems"])
+    assert result[1]["progress"]["hours"] == 4
+
+
+def test_numeric_save_uses_latest_file_instead_of_stale_session(client):
+    from dataclasses import replace
+    api, session = client
+    day = session.days[0]
+    old = day.orders[0]
+    fresh = replace(old, progress=replace(old.progress, plan="核对验收结果"))
+    store.save_days(session.path, SINCE, UNTIL, [replace(day, orders=(fresh,))])
+    api.post("/api/progress", {"day": day.day, "orderId": "1", "rate": 70, "hours": 7.5})
+    assert store.load_days(session.path)[0].orders[0].progress.plan == "核对验收结果"
+
+
+def test_numeric_save_rechecks_progress_order_across_dates(client):
+    from dataclasses import replace
+    api, session = client
+    day = session.days[0]
+    old = day.orders[0]
+    previous = replace(old, progress=replace(old.progress, rate=80, hours=7.5))
+    following = replace(old, progress=replace(old.progress, rate=90, hours=7.5))
+    store.save_days(session.path, SINCE, UNTIL, [
+        replace(day, orders=(previous,)), replace(day, day="2026-10-27", orders=(following,)),
+    ])
+    body = json.loads(api.post("/api/progress", {
+        "day": "2026-10-27", "orderId": "1", "rate": 70, "hours": 7.5,
+    })[1])
+    problems = body["days"][1]["orders"][0]["progress"]["problems"]
+    assert any("进展" in problem or "进度" in problem for problem in problems)
+
+
+def test_body_limit_and_absent_origin_are_rejected(client):
+    api, _ = client
+    assert raw_post(api, b" " * 65537)[0] == 400
+    request = Request(api._base + "/api/progress", data=b"{}", headers={"Content-Type": "application/json"})
+    with pytest.raises(HTTPError) as exc:
+        urlopen(request)
+    assert exc.value.code == 403
+
+
+@pytest.mark.parametrize("client", [Config(
+    gitlab=GitlabConfig("", ""), eom=FULL.eom, ai=AiConfig("", "", "m"),
+)], indirect=True)
+def test_submit_delegates_to_service_with_eom_only_and_refreshes_local_state(client, monkeypatch):
+    from dataclasses import replace
+    from git_daily_report import submit as service
+
+    api, session = client
+    calls = []
+    def fake_submit(cfg, path, since, until, *, retry_unknown=False):
+        calls.append((cfg, since, until, retry_unknown))
+        day = store.load_days(path)[0]
+        order = day.orders[0]
+        filled = replace(order, progress=replace(order.progress, source="eom", rate=70, hours=7.5))
+        store.save_days(path, since, until, [replace(day, orders=(filled,))])
+        return {"days": [{"day": day.day, "status": "submitted"}]}
+    monkeypatch.setattr(service, "submit_report", fake_submit)
+    assert api.post("/api/submit", {"retryUnknown": True})[0] == 200
+    assert calls == [(FULL.eom, SINCE, UNTIL, True)]
+    assert session.days[0].orders[0].progress.source == "eom"
+
+
+def test_report_state_does_not_expose_credentials(client):
+    api, _ = client
+    body = api.get("/api/state")[1]
+    payload = json.loads(body)
+    assert "token" not in payload
+    assert "ai" not in payload
+    assert "gitlab" not in payload
+    assert FULL.eom.base_url not in body

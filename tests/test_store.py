@@ -37,3 +37,17 @@ def test_missing_or_broken_file_reads_as_empty(tmp_path):
     broken = tmp_path / "broken.json"
     broken.write_text("{", encoding="utf-8")
     assert store.load_days(broken) == []
+
+
+def test_failed_atomic_save_preserves_existing_report(tmp_path, monkeypatch):
+    import os
+    import pytest
+    path = tmp_path / "report.json"
+    original = [ScheduleDay("2026-10-26", (Order("1", "原内容", "任务", "项目"),))]
+    store.save_days(path, date(2026, 10, 26), date(2026, 11, 1), original)
+    def failed_replace(*args):
+        raise OSError("模拟写入失败")
+    monkeypatch.setattr(os, "replace", failed_replace)
+    with pytest.raises(OSError):
+        store.save_days(path, date(2026, 10, 26), date(2026, 11, 1), [])
+    assert store.load_days(path) == original

@@ -53,6 +53,8 @@ def block(**overrides):
         "problem": ["无"],
         "issue": "无",
         "plan": "完成筛选结果联调",
+        "rate": 50,
+        "hours": 3,
     }
     return {**base, **overrides}
 
@@ -74,3 +76,18 @@ def test_code_terms_are_reported_with_the_offending_word():
     problems = check_block(block(problem=["修复 getUserInfo 报错"]))
 
     assert any("getUserInfo" in p for p in problems)
+
+
+def test_amended_rate_ignores_stale_bounds_but_must_not_regress():
+    from git_daily_report.models import Order, Progress, ScheduleDay
+    from git_daily_report.validate import validate_days
+
+    def day(d, rate):
+        p = Progress(memo="随意 text", issue="", plan="", source="amend", rate=rate, hours=3,
+                     report_id="r", original_rate=90)
+        return ScheduleDay(d, (Order("1", "t", "t", "p", p, rate_min=90),))
+
+    ok = validate_days([day("2026-10-12", 20), day("2026-10-13", 30)])
+    assert not any(o.progress.problems for d in ok for o in d.orders)
+    bad = validate_days([day("2026-10-12", 30), day("2026-10-13", 20)])
+    assert bad[1].orders[0].progress.problems

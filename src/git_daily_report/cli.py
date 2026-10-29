@@ -1,7 +1,7 @@
 """命令行入口。
 
-裸 `dr` 起本机服务并打开浏览器；`material` / `apply` 给 Claude Code skill 用：
-Claude 拿素材自己写进展，工具只负责校验与落盘，结果照样在网页上逐块复制。
+裸 `dr` 起本机服务并打开浏览器；`material` / `apply` 给 Codex 或 Claude Code
+技能生成和校验；`amend` 按各工单 ID 重排已填百分比；`submit` 独立提交本地报告到 EOM。
 """
 
 from __future__ import annotations
@@ -13,11 +13,15 @@ from pathlib import Path
 from typing import Any
 
 from .config import OUTPUT_DIR, ConfigError, load_config
+from .amend import propose
 from .generate import MISSING, apply_blocks, build_material, parse_items, system_prompt
 from .period import resolve, week_range
 from .pipeline import fetch
 from .sources._http import SourceError
+from .sources.eom import EomClient
 from .store import load_days, report_path, save_days
+from .submit import submit_report
+from .locking import report_lock
 from .web.server import serve
 
 
@@ -38,6 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     apply = commands.add_parser("apply", help="校验并保存写好的进展")
     apply.add_argument("file", type=Path, help='写好的进展，格式为 {"items": [...]}')
     _add_period(apply)
+    amend = commands.add_parser("amend", help="按各工单 ID 独立重排已填日报的百分比，保存待核对")
+    _add_period(amend)
+    submit = commands.add_parser("submit", help="将已校验的本地报告提交到 EOM")
+    _add_period(submit)
+    submit.add_argument("--dry-run", action="store_true", help="读取最新排期并预检，不写入 EOM")
+    submit.add_argument("--retry-unknown", action="store_true", help="核实后主动重试结果未知且未发现日报的批次")
     return parser
 
 
@@ -50,11 +60,25 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         since, until = resolve(since=args.since, until=args.until)
-        result = _material(since, until) if args.command == "material" else _apply(args.file, since, until)
+        if args.command == "material":
+            result = _material(since, until)
+        elif args.command == "apply":
+            result = _apply(args.file, since, until)
+        elif args.command == "amend":
+            result = _amend(since, until)
+        else:
+            cfg = load_config()
+            cfg.require(need_ai=False, need_gitlab=False)
+            result = submit_report(cfg.eom, report_path(OUTPUT_DIR, since, until), since, until,
+                                   dry_run=args.dry_run, retry_unknown=args.retry_unknown)
     except (CliError, ConfigError, SourceError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.command == "submit" and any(
+        d["status"] not in {"submitted", "skipped", "ready"} for d in result["days"]
+    ):
+        return 1
     return 0
 
 
@@ -66,9 +90,10 @@ def _add_period(parser: argparse.ArgumentParser) -> None:
 def _material(since, until) -> dict[str, Any]:
     cfg = load_config()
     cfg.require(need_ai=False)
-    days, commits = fetch(cfg, since, until, lambda line: print(line, file=sys.stderr))
     path = report_path(OUTPUT_DIR, since, until)
-    save_days(path, since, until, days)
+    with report_lock(path):
+        days, commits = fetch(cfg, since, until, lambda line: print(line, file=sys.stderr))
+        save_days(path, since, until, days)
     return {
         "path": str(path),
         "rules": system_prompt(),
@@ -79,8 +104,31 @@ def _material(since, until) -> dict[str, Any]:
     }
 
 
+def _amend(since, until) -> dict[str, Any]:
+    cfg = load_config()
+    cfg.require(need_ai=False, need_gitlab=False)
+    path = report_path(OUTPUT_DIR, since, until)
+    with report_lock(path):
+        days = propose(EomClient(cfg.eom), since, until)
+        save_days(path, since, until, days)
+    return {
+        "path": str(path),
+        "changes": [
+            {"day": d.day, "orderId": o.id, "title": o.title,
+             "from": o.progress.original_rate, "to": o.progress.rate}
+            for d in days for o in d.orders if o.progress and o.progress.source == "amend"
+        ],
+        "unfilled": [{"day": d.day, "orderId": o.id} for d in days for o in d.orders if o.progress is None],
+    }
+
+
 def _apply(file: Path, since, until) -> dict[str, Any]:
     path = report_path(OUTPUT_DIR, since, until)
+    with report_lock(path):
+        return _apply_locked(file, path, since, until)
+
+
+def _apply_locked(file: Path, path: Path, since, until) -> dict[str, Any]:
     days = load_days(path)
     if not days:
         raise CliError(f"{path} 里没有排期，先运行 dr material 拉取同一区间。")

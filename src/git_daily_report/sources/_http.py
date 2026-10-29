@@ -26,10 +26,12 @@ def request(
     json_body: Any | None = None,
     timeout: int = DEFAULT_TIMEOUT,
     source: str = "",
+    attempts: int = MAX_ATTEMPTS,
+    allow_redirects: bool = True,
 ) -> requests.Response:
     """发请求并对限流、5xx 与网络抖动做有限重试。"""
     last_error: Exception | None = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
             response = requests.request(
                 method,
@@ -38,15 +40,16 @@ def request(
                 params=dict(params or {}),
                 json=json_body,
                 timeout=timeout,
+                allow_redirects=allow_redirects,
             )
         except requests.RequestException as exc:
             last_error = exc
-            if attempt == MAX_ATTEMPTS:
+            if attempt == attempts:
                 break
             time.sleep(BACKOFF_SECONDS * attempt)
             continue
 
-        if response.status_code in RETRY_STATUS and attempt < MAX_ATTEMPTS:
+        if response.status_code in RETRY_STATUS and attempt < attempts:
             time.sleep(BACKOFF_SECONDS * attempt)
             continue
         return response

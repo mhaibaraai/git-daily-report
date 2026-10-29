@@ -44,3 +44,11 @@ def test_full_text_groups_by_day_and_order():
 
 def test_empty_week_exports_nothing():
     assert to_text([]) == ""
+
+
+def test_export_includes_generated_numbers_as_estimates():
+    p = Progress("具体任务：完成核对\n关键数据：无\n问题解决过程：无", "无", "继续核对", "ai",
+                 rate=65, hours=4.5)
+    text = to_text([ScheduleDay("2026-10-26", (Order("1", "核对", "任务", "项目", p),))])
+    assert "工单进展：65%（估算，可调整）" in text
+    assert "当日工时：4.5h（估算，可调整）" in text
