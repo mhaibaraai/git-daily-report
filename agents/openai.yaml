@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git 工作报告"
+  short_description: "结合 GitLab、本地 Git 与 EOM 工单整理日报周报并按需提交进展"
+  default_prompt: "使用 $git-daily-report 结合 GitLab 提交与 EOM 排期生成本周工单进展，先保存草稿。"
