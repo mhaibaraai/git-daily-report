@@ -1,0 +1,24 @@
+{
+  "profiles": {
+    "default": {
+      "workspace": "~/git-daily-report-data",
+      "timezone": "UTC",
+      "archive_dir": "reports",
+      "daily_hours": null,
+      "commit_slack_days": 3,
+      "gitlab": {
+        "base_url": "https://gitlab.example.invalid",
+        "token_env": "GITLAB_TOKEN",
+        "projects": [],
+        "authors": [],
+        "all_authors": false
+      },
+      "eom": {
+        "base_url": "https://work.example.invalid",
+        "token_env": "EOM_TOKEN",
+        "worker_id": "REPLACE_WITH_WORKER_ID"
+      },
+      "mappings": []
+    }
+  }
+}

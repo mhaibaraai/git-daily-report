@@ -1,7 +1,12 @@
-.env
+.env*
 __pycache__/
 *.pyc
 .venv/
 output/
 .coverage
 .pytest_cache/
+# Local review snapshots and annual report archives
+/reports/
+*.local.json
+git-daily-report-data/
+.DS_Store
