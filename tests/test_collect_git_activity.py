@@ -68,7 +68,7 @@ class CollectionTests(unittest.TestCase):
     def git(self, repo, *args, env=None):
         return subprocess.run(
             ["git", "-C", str(repo), *args], check=True, capture_output=True,
-            text=True, env=dict(env or os.environ, GIT_CONFIG_GLOBAL=os.devnull,
+            encoding="utf-8", env=dict(env or os.environ, GIT_CONFIG_GLOBAL=os.devnull,
                                 GIT_CONFIG_NOSYSTEM="1"),
         ).stdout.strip()
 
@@ -91,6 +91,19 @@ class CollectionTests(unittest.TestCase):
 
     def collect(self, **kwargs):
         return collector.collect_activity([self.repo], self.span, **kwargs)
+
+    def test_git_output_preserves_chinese_with_non_utf8_locale(self):
+        run = subprocess.run
+
+        def run_with_windows_encoding(*args, **kwargs):
+            # Simulate the Windows pipe default while keeping real Git output.
+            kwargs.setdefault("encoding", "cp1252")
+            return run(*args, **kwargs)
+
+        with mock.patch.object(subprocess, "run", side_effect=run_with_windows_encoding):
+            self.commit("完成筛选")
+            subject = self.git(self.repo, "log", "-1", "--format=%s")
+        self.assertEqual(subject, "完成筛选")
 
     def test_collects_messages_without_remote_urls_paths_or_email(self):
         sha = self.commit("feat: Add search\n\nSupport exact matches.\n保留中文。")
