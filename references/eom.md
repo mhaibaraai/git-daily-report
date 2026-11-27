@@ -12,7 +12,7 @@ python3 /path/to/git-daily-report/scripts/report.py material --config /path/to/s
 
 - `path`：草稿文件位置，位于用户工作目录。
 - `apply`、`amend`、`revise` 成功保存内容后另返回 `reviewPath`，为自动生成的本地 Markdown 核查稿。
-- `material.schedule`：按日期组织的工单、已填内容、草稿和历史进度约束。
+- `material.schedule`：按日期组织的工单、已填内容、草稿和历史进度约束。工单的 `endDay` 来自 EOM 的 `ewlEndTime`，缺失或无有效日期时为 `null`。
 - `material.commits`：GitLab 素材；`material.mappings` 为明确配置的工单映射。
 - `pending`：需要生成或修正草稿的日期与工单 ID。
 - `validation`：当前通过、失败和缺失的块。
@@ -51,9 +51,9 @@ python3 /path/to/git-daily-report/scripts/report.py material --config /path/to/s
 - `task`：非空字符串数组，具体工作不能为“无”；`data` 和 `problem` 为字符串数组，可为空，无事实时渲染为“无”。`issue` 无事实时同样填“无”。业务正文不得包含素材分配或生成审核说明；脚本在生成校验和提交预检中拦截已知说明，返回所在字段，要求重写，不静默删除。
 - `issue`：字符串，可为空；`plan` 为非空字符串。缺乏已确认计划时可先提出建议，但必须设 `planSuggested: true`，在用户确认前阻止提交。
 - `rate`：0–100 的有限 JSON 数值；`hours`：大于 0 的有限数值。拒绝布尔值、数字字符串与非有限数。
-- `estimatedFields`：只允许 `rate`、`hours`，省略时默认两者均为估算；只有用户明确提供事实值时才移除对应标记。
+- `estimatedFields`：只允许 `rate`、`hours`，省略时默认两者均为估算。用户提供事实值时移除对应标记。结项日按规则填写 `rate: 100` 时也移除 `rate` 标记。
 - 同一天先扣除 EOM 已填工时，再按工作量估算分配剩余预算；合计不能超过 `daily_hours`。已填工时缺失时不能自行猜补。
-- 同一 ID 的百分比不得按日期倒退，也不得越过已填的前后历史进度；不同 ID 独立估算。
+- 同一 ID 的累计进度不得倒退或越过已填历史进度。结项日填 `rate: 100`，结项日期以用户确认为先，其次参考 `endDay`。例如工单做到下周，本周五仍按实际进展填报。若用户确认本周五结项，则周五填 100%。
 
 执行 `apply <文件.json>` 后读取 JSON 中的 `passed`、`failures`、`missing`。输入日期与 ID 必须来自当前排期，不接受重复或未知键；局部更新会重新校验整天和跨日进度，其他块保持。
 

@@ -55,6 +55,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result["pending"], [{"day": "2026-01-06", "orderId": "order-1"}])
         self.assertTrue(result["validation"]["failures"])
 
+    def test_material_exposes_order_end_day_independently_of_report_range(self):
+        self.eom.days["2026-01-06"] = [
+            dict(raw_order(), ewlEndTime="2026-01-09 18:00:00"),
+            dict(raw_order("order-2"), ewlEndTime=None),
+            dict(raw_order("order-3"), ewlEndTime="unknown"),
+        ]
+        result = material(self.profile, self.span, gitlab=self.gitlab, eom=self.eom)
+        orders = result["material"]["schedule"][0]["orders"]
+        self.assertEqual([order["endDay"] for order in orders], ["2026-01-09", None, None])
+
     def test_removed_drafts_require_explicit_archival_before_other_orders_can_submit(self):
         self.eom.days["2026-01-06"].append(raw_order("order-2"))
         self.prepare([item(hours=4), item(order_id="order-2", hours=4)])

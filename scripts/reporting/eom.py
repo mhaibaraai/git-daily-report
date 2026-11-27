@@ -134,6 +134,10 @@ class EomClient:
 
 def normalize(raw):
     report = raw.get("report") or {}
+    try:
+        end_day = day_string(raw.get("ewlEndTime"))
+    except ReportError:
+        end_day = None
     progress = None
     if report.get("id"):
         progress = {"source": "eom", "memo": report.get("memo") or "",
@@ -142,6 +146,7 @@ def normalize(raw):
                     "reportId": identifier(report["id"]), "estimatedFields": []}
     return {"id": identifier(raw["id"]), "title": raw.get("ewlTitle") or "",
             "taskTitle": raw.get("eTaskTitle") or "", "projectName": raw.get("eProjectName") or "",
+            "endDay": end_day,
             "workerId": identifier(raw["ewlWorker"]), "rateMin": raw.get("_rateMin"),
             "rateMax": raw.get("_rateMax"), "previousDay": raw.get("_previousDay", ""),
             "previousMemo": raw.get("_previousMemo", ""), "rateAnchors": raw.get("_rateAnchors", []),
